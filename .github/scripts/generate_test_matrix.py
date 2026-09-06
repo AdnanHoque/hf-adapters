@@ -23,7 +23,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-import tests.model_registry  # noqa: E402
+from test_matrix_config import MATRIX_CONFIG, MatrixKey  # noqa: E402
 
 
 def generate_matrices(exclude_models=None, only_models=None):
@@ -46,50 +46,23 @@ def generate_matrices(exclude_models=None, only_models=None):
     # --only so a caller can target a non-representative checkpoint, e.g. a
     # larger model sharing an adapter with a smaller default). Adding a new
     # category later just means adding a row here.
-    registry = tests.model_registry
-    categories = {
-        "causal": (registry.CAUSAL_PATHS, registry.ALL_CAUSAL_PATHS),
-        "embed": (registry.EMBED_PATHS, registry.ALL_EMBED_PATHS),
-        "vision": (registry.VISION_PATHS, registry.ALL_VISION_PATHS),
-        "masked_lm": (registry.MASKED_LM_PATHS, registry.ALL_MASKED_LM_PATHS),
-        "question_answering": (
-            registry.QUESTION_ANSWERING_PATHS,
-            registry.ALL_QUESTION_ANSWERING_PATHS,
-        ),
-        "reranker": (registry.RERANKER_PATHS, registry.ALL_RERANKER_PATHS),
-        "token_classification": (
-            registry.TOKEN_CLASSIFICATION_PATHS,
-            registry.ALL_TOKEN_CLASSIFICATION_PATHS,
-        ),
-    }
-
     paths = {}
-    for name, (representative_paths, all_paths) in categories.items():
+    for name, (_, representative_paths, all_paths) in MATRIX_CONFIG.items():
         source = all_paths if only_models else representative_paths
         selected = [p for p in source if p not in exclude_models]
         if only_models:
             selected = [p for p in selected if p in only_models]
         paths[name] = selected
 
-    # Feeds spyre-load-tests' matrix: test_load_spyre.py's five model_path suites.
-    combined_paths = (
-        paths["causal"]
-        + paths["embed"]
-        + paths["masked_lm"]
-        + paths["question_answering"]
-        + paths["token_classification"]
+    # Feeds test_load_spyre.py's five model_path-parametrized suites.
+    paths[MatrixKey.COMBINED] = (
+        paths[MatrixKey.CAUSAL]
+        + paths[MatrixKey.EMBED]
+        + paths[MatrixKey.MASKED_LM]
+        + paths[MatrixKey.QUESTION_ANSWERING]
+        + paths[MatrixKey.TOKEN_CLASSIFICATION]
     )
-
-    return {
-        "causal": paths["causal"],
-        "embed": paths["embed"],
-        "vision": paths["vision"],
-        "masked_lm": paths["masked_lm"],
-        "question_answering": paths["question_answering"],
-        "combined": combined_paths,
-        "reranker": paths["reranker"],
-        "token_classification": paths["token_classification"],
-    }
+    return paths
 
 
 def format_for_github_actions(matrices):
@@ -102,16 +75,7 @@ def format_for_github_actions(matrices):
     Returns:
         dict: Dictionary with JSON-stringified matrices
     """
-    return {
-        "causal_matrix": json.dumps(matrices["causal"]),
-        "embed_matrix": json.dumps(matrices["embed"]),
-        "vision_matrix": json.dumps(matrices["vision"]),
-        "masked_lm_matrix": json.dumps(matrices["masked_lm"]),
-        "question_answering_matrix": json.dumps(matrices["question_answering"]),
-        "combined_matrix": json.dumps(matrices["combined"]),
-        "reranker_matrix": json.dumps(matrices["reranker"]),
-        "token_classification_matrix": json.dumps(matrices["token_classification"]),
-    }
+    return {key.value: json.dumps(matrices[key]) for key in MatrixKey}
 
 
 def write_github_output(outputs):
@@ -154,40 +118,28 @@ def main():
         help="If given, restrict all matrices to just these model paths "
         "(e.g., Qwen/Qwen3-0.6B ministral/Ministral-3B-Instruct)",
     )
+    parser.add_argument("--output-file", type=Path)
+    parser.add_argument("--publish-file", type=Path)
 
     args = parser.parse_args()
+
+    if args.publish_file:
+        stored = json.loads(args.publish_file.read_text())
+        missing = {key.value for key in MatrixKey} - set(stored)
+        if missing:
+            parser.error(f"matrix file is missing keys: {', '.join(sorted(missing))}")
+        write_github_output(
+            {key.value: json.dumps(stored[key.value]) for key in MatrixKey}
+        )
+        return
 
     # Generate matrices
     matrices = generate_matrices(exclude_models=args.exclude, only_models=args.only)
 
     # Print summary for workflow logs
     print("Generated test matrices:")
-    print(
-        f"  Causal models ({len(matrices['causal'])}): {', '.join(matrices['causal'])}"
-    )
-    print(
-        f"  Embedding models ({len(matrices['embed'])}): {', '.join(matrices['embed'])}"
-    )
-    print(
-        f"  Vision models ({len(matrices['vision'])}): {', '.join(matrices['vision'])}"
-    )
-    print(
-        f"  Masked-LM models ({len(matrices['masked_lm'])}): {', '.join(matrices['masked_lm'])}"
-    )
-    print(
-        f"  Question-answering models ({len(matrices['question_answering'])}): "
-        f"{', '.join(matrices['question_answering'])}"
-    )
-    print(
-        f"  Combined ({len(matrices['combined'])}): {', '.join(matrices['combined'])}"
-    )
-    print(
-        f"  Reranker models ({len(matrices['reranker'])}): {', '.join(matrices['reranker'])}"
-    )
-    print(
-        f"  Token-classification models ({len(matrices['token_classification'])}): "
-        f"{', '.join(matrices['token_classification'])}"
-    )
+    for key in MatrixKey:
+        print(f"  {key.value} ({len(matrices[key])}): {', '.join(matrices[key])}")
 
     if args.exclude:
         print(f"\nExcluded models: {', '.join(args.exclude)}")
@@ -196,6 +148,10 @@ def main():
 
     # Format for GitHub Actions
     outputs = format_for_github_actions(matrices)
+    if args.output_file:
+        args.output_file.write_text(
+            json.dumps({key.value: matrices[key] for key in MatrixKey})
+        )
 
     # Write to GitHub Actions output
     write_github_output(outputs)

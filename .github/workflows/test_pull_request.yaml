@@ -136,6 +136,8 @@ jobs:
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       skip_tests: ${{ needs.detect-label.outputs.labeled == 'true' }}
+      # One-line kill switch: set false to restore the complete model matrices.
+      filter_models_by_changes: true
 
   # ----------------------------------------------------------------------------------
   # Required check gate -- fans in detect-label and the delegated suite run so a

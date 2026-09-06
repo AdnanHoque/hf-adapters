@@ -117,6 +117,13 @@ on:
         required: false
         type: boolean
         default: false
+      filter_models_by_changes:
+        description: >-
+          Filter generated model matrices to adapters affected by the PR's
+          changed files. Conservative fallbacks keep the full matrices.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   # Needed by collect-failed-suites to list/download failed-suite-* artifacts via the REST API; reusable workflows can only narrow the caller's permissions, so callers must grant this too.
@@ -239,8 +246,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install transformers torch pytest
 
-      - name: Generate matrices
-        id: generate
+      - name: Generate complete matrices
         env:
           # Piped through env (not interpolated directly into the script) since
           # this is caller-supplied workflow_call input.
@@ -253,7 +259,30 @@ jobs:
             read -r -a ONLY_ARGS <<< "$ONLY_MODELS"
             ONLY_ARGS=(--only "${ONLY_ARGS[@]}")
           fi
-          python .github/scripts/generate_test_matrix.py "${ONLY_ARGS[@]}"
+          python .github/scripts/generate_test_matrix.py \
+            "${ONLY_ARGS[@]}" \
+            --output-file "$RUNNER_TEMP/test-matrices.json"
+
+      - name: Filter matrices by changed adapters
+        if: ${{ inputs.filter_models_by_changes && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Keep checkout shallow and fetch only the two commits needed for the diff.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-files.txt"
+          python .github/scripts/filter_test_matrix.py \
+            --changed-files "$RUNNER_TEMP/changed-files.txt" \
+            --matrix-file "$RUNNER_TEMP/test-matrices.json"
+
+      - name: Publish matrices
+        id: generate
+        if: ${{ always() }}
+        run: |
+          python .github/scripts/generate_test_matrix.py \
+            --publish-file "$RUNNER_TEMP/test-matrices.json"
 
   # ===========================================================================
   # Generates spyre-model-module-tests' matrix from the tests/configs/module_tests/
@@ -451,7 +480,7 @@ jobs:
     # space-separated word in test_type (e.g. "smoke load") for fine-grained
     # selection.
     # See spyre-smoke-tests for the other keys.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' load ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.combined_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' load ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-load-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -522,7 +551,7 @@ jobs:
     # only job that tier runs). Same allowlist mechanism as spyre-load-tests
     # above -- to add a new suite later, give the new job its own key and
     # copy this `if:` line with that key; no existing job needs to change.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' smoke ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.causal_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' smoke ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-smoke-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -589,7 +618,7 @@ jobs:
     name: Spyre token compare (${{ matrix.model_key }})
     needs: [generate-matrix, resolve-test-type]
     # Suite key: "token_compare". Part of the "unit" coarse tier.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'integration' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' token_compare ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.causal_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'integration' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' token_compare ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-token-compare-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -656,7 +685,7 @@ jobs:
     name: Spyre embed compare (${{ matrix.model_key }})
     needs: [generate-matrix, resolve-test-type]
     # Suite key: "embed_compare". Part of the "unit" coarse tier.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' embed_compare ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.embed_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' embed_compare ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-embed-compare-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -723,7 +752,7 @@ jobs:
     name: Spyre VLM e2e (${{ matrix.model_key }})
     needs: [generate-matrix, resolve-test-type]
     # Suite key: "vlm". Part of the "unit" coarse tier.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' vlm ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.vision_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' vlm ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-vlm-e2e-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -849,7 +878,7 @@ jobs:
     name: Spyre reranker compare (${{ matrix.model_key }})
     needs: [generate-matrix, resolve-test-type]
     # Suite key: "reranker_compare". Part of the "unit" coarse tier.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' reranker_compare ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.reranker_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' reranker_compare ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-reranker-compare-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -913,7 +942,7 @@ jobs:
     name: Spyre masked-LM compare (${{ matrix.model_key }})
     needs: [generate-matrix, resolve-test-type]
     # Suite key: "masked_lm_compare". Part of the "unit" coarse tier.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' masked_lm_compare ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.masked_lm_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' masked_lm_compare ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-masked-lm-compare-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -977,7 +1006,7 @@ jobs:
     name: Spyre question-answering compare (${{ matrix.model_key }})
     needs: [generate-matrix, resolve-test-type]
     # Suite key: "question_answering_compare". Part of the "unit" coarse tier.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' question_answering_compare ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.question_answering_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' question_answering_compare ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-question-answering-compare-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -1041,7 +1070,7 @@ jobs:
     name: Spyre token-classification compare (${{ matrix.model_key }})
     needs: [generate-matrix, resolve-test-type]
     # Suite key: "token_classification_compare". Part of the "unit" coarse tier.
-    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' token_classification_compare ')) }}
+    if: ${{ !inputs.skip_tests && !inputs.edge_cases_only && needs.generate-matrix.outputs.token_classification_matrix != '[]' && (needs.resolve-test-type.outputs.test_type == 'regression' || needs.resolve-test-type.outputs.test_type == 'trunk' || needs.resolve-test-type.outputs.test_type == 'unit' || contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' token_classification_compare ')) }}
     # Don't let one failed model leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-token-classification-compare-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:
@@ -1118,7 +1147,7 @@ jobs:
   spyre-edge-cases-tests:
     name: Spyre edge case ${{ matrix.test_file }} (${{ matrix.model_key }})
     needs: [generate-matrix]
-    if: ${{ !inputs.skip_tests && inputs.edge_cases_only }}
+    if: ${{ !inputs.skip_tests && inputs.edge_cases_only && needs.generate-matrix.outputs.causal_matrix != '[]' }}
     # Don't let one failed (model, test_file) leg fail this job outright -- spyre-tests-result decides pass/fail after the pod-level retry (spyre-edge-cases-tests-retry) gets a shot on a fresh pod.
     continue-on-error: true
     runs-on:

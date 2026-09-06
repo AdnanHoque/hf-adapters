@@ -59,4 +59,19 @@ No workflow changes needed!
 - transformers
 - torch
 
+### Optional PR impact filtering
+
+The reusable test workflow first writes the complete generated matrices to one
+JSON file. When `filter_models_by_changes` is enabled for a pull request,
+`filter_test_matrix.py` atomically replaces that file with matrices restricted
+to adapters affected by the changed Python modules. This narrowing is attempted
+only when every changed file is an `hf_adapters/hf_*.py` file, or when every
+change is documentation under `docs/` or one of the recognized root docs.
+Mixed or unrecognized changes retain the complete matrices. A final publisher
+exposes the file through the usual individual GitHub Actions outputs. If
+filtering is skipped or fails, the original complete file remains available.
+
+`test_matrix_config.py` is the shared source of truth for matrix keys, model
+registries, representative paths, and complete path lists.
+
 These are installed in the `generate-matrix` job before running the script.
