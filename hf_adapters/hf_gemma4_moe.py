@@ -39,13 +39,29 @@ __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
-# Private opt-in pending model numerical acceptance. The route assignment and
+# Enabled automatically for supported decode calls. The route assignment and
 # the compiler's indexed-selection layout are a measured pair: either alone
 # regressed this workload. Keep the compiler option scoped to decode calls.
-_DECODE_ROUTE_SCHEDULE = False
-# Independent of gate/up reduction blocking. The measured opt-in is 1024;
+_DECODE_ROUTE_SCHEDULE = True
+
+
+def _decode_route_schedule_enabled(tokens, top_k):
+    """Pair R8 with its compiler capability; other shapes use ordinary decode."""
+    if not _DECODE_ROUTE_SCHEDULE or tokens != 1 or top_k != 8:
+        return False
+    from torch_spyre._inductor import config
+
+    return (
+        hasattr(config, "indexed_selection_consumer_layout")
+        and config.sencores == 32
+        and not config.ignore_work_division_hints
+        and not config.ignore_wsr_hints
+    )
+
+
+# Independent of gate/up reduction blocking. Enabled at width 1024;
 # smaller widths and intermediate-retention experiments are not shipped.
-_DECODE_DOWN_OUTPUT_PANEL = None
+_DECODE_DOWN_OUTPUT_PANEL = 1024
 
 
 def _decode_down_output_blocks(activated, down_bank, expert_indices, block_size):
@@ -69,6 +85,20 @@ def _decode_down_output_blocks(activated, down_bank, expert_indices, block_size)
         with spyre_hint(named_dims=["R", "ONE", "H"], work_div={"R": rows, "H": 1}):
             outputs.append(torch.bmm(activated, selected))
     return torch.cat(outputs, dim=-1)
+
+
+def _decode_down_panel(hidden, intermediate, dtypes, route_schedule):
+    """Choose the measured block width only for its supported decode shape."""
+    if _DECODE_DOWN_OUTPUT_PANEL not in (None, 1024):
+        raise ValueError("Unsupported decode block width; expected 1024 or None")
+    if (
+        route_schedule
+        and hidden == 2816
+        and intermediate == 704
+        and all(dtype == torch.float16 for dtype in dtypes)
+    ):
+        return _DECODE_DOWN_OUTPUT_PANEL
+    return None
 
 
 def _name_prefill_inputs(x, gate, up, down):
@@ -130,17 +160,13 @@ def _compiled_moe_loop_region(
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
     T, H = x_expert.shape
-    if _DECODE_ROUTE_SCHEDULE and (T != 1 or top_k != 8):
-        raise ValueError(
-            "The decode route schedule requires one token and eight routes"
-        )
-    if _DECODE_DOWN_OUTPUT_PANEL is not None and (
-        not _DECODE_ROUTE_SCHEDULE
-        or _DECODE_DOWN_OUTPUT_PANEL != 1024
-        or H != 2816
-        or gate_dev.shape[-1] != 704
-    ):
-        raise ValueError("Down blocks require the Gemma4 R8 decode shape and width 1024")
+    route_schedule = _decode_route_schedule_enabled(T, top_k)
+    down_panel = _decode_down_panel(
+        H,
+        gate_dev.shape[-1],
+        (x_expert.dtype, gate_dev.dtype, up_dev.dtype, down_dev.dtype),
+        route_schedule,
+    )
     probs = _router_probs(
         x_router,
         router_proj_w,
@@ -166,10 +192,10 @@ def _compiled_moe_loop_region(
         )
         gate = gate_dev[expert_indices].reshape(rows, H, intermediate)
         up = up_dev[expert_indices].reshape(rows, H, intermediate)
-        if _DECODE_DOWN_OUTPUT_PANEL is None:
+        if down_panel is None:
             down = down_dev[expert_indices].reshape(rows, intermediate, H)
 
-        if _DECODE_ROUTE_SCHEDULE:
+        if route_schedule:
             with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
                 gate_out = torch.bmm(inputs, gate)
                 up_out = torch.bmm(inputs, up)
@@ -177,9 +203,9 @@ def _compiled_moe_loop_region(
             gate_out = torch.bmm(inputs, gate)
             up_out = torch.bmm(inputs, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
-        if _DECODE_DOWN_OUTPUT_PANEL is not None:
+        if down_panel is not None:
             expert_out = _decode_down_output_blocks(
-                activated, down_dev, expert_indices, _DECODE_DOWN_OUTPUT_PANEL
+                activated, down_dev, expert_indices, down_panel
             )
         else:
             expert_out = torch.bmm(activated, down)
@@ -461,12 +487,13 @@ class Gemma4MoEBlock(nn.Module):
                 hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
             _reset_named_dims()
         else:
-            # Requires Torch-Spyre's indexed-selection layout capability.
-            # An older compiler rejects the explicit option rather than
-            # silently running the slower route-only configuration.
+            # Do not enable the slower route-only configuration on an older
+            # compiler. Both the wrapper and region use this same eligibility.
             decode_config = (
                 optional_spyre_config_patch({"indexed_selection_consumer_layout": True})
-                if _DECODE_ROUTE_SCHEDULE
+                if _decode_route_schedule_enabled(
+                    hidden_states.shape[0] * hidden_states.shape[1], self._moe_k
+                )
                 else nullcontext()
             )
             with decode_config:
