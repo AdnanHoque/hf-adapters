@@ -69,21 +69,21 @@ class PrefillLogitRowTests(unittest.TestCase):
                         .to(dtype)
                     )
                     self.assertTrue(
-                        torch.equal(helper(x), helper(x, last_row_only=True))
+                        torch.equal(helper(x, last_row_only=False), helper(x))
                     )
                     self.assertEqual(helper(x, last_row_only=True).shape, (2, 11))
 
     def test_materializes_one_row_before_cpu_transfer(self):
         events = []
         x = TrackedTensor(torch.arange(2 * 9 * 13).reshape(2, 9, 13), events)
-        out = load_helper()(x, last_row_only=True)
+        out = load_helper()(x)
         self.assertEqual(events, [("clone", (2, 1, 13)), ("cpu", (2, 1, 13))])
         self.assertTrue(torch.equal(out.value, x.value[:, -1, :]))
 
     def test_off_retains_full_transfer_without_clone(self):
         events = []
         x = TrackedTensor(torch.zeros(2, 9, 13), events)
-        load_helper()(x)
+        load_helper()(x, last_row_only=False)
         self.assertEqual(events, [("cpu", (2, 9, 13))])
 
     def test_noncontiguous_input_and_distinct_storage(self):
@@ -97,7 +97,7 @@ class PrefillLogitRowTests(unittest.TestCase):
             out.untyped_storage().nbytes(), out.numel() * out.element_size()
         )
 
-    def test_only_prefill_uses_helper_and_flag_defaults_off(self):
+    def test_only_prefill_uses_helper_and_flag_defaults_on(self):
         generate = next(
             n
             for n in ast.parse(SOURCE.read_text()).body
@@ -106,7 +106,7 @@ class PrefillLogitRowTests(unittest.TestCase):
         names = [n.arg for n in generate.args.kwonlyargs]
         self.assertIs(
             generate.args.kw_defaults[names.index("_prefill_last_row_only")].value,
-            False,
+            True,
         )
         calls = [
             n
