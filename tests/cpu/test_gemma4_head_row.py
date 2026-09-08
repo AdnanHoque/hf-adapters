@@ -111,12 +111,15 @@ class GemmaHeadRowTests(unittest.TestCase):
             pass
 
         self.assertEqual(options(supported, True), {"_last_hidden_row_only": True})
+        self.assertEqual(options(supported), {"_last_hidden_row_only": True})
+        self.assertEqual(options(supported, False), {})
         for driver in (swallowed, positional, same_name_kwargs):
+            self.assertEqual(options(driver), {})
             self.assertEqual(options(driver, False), {})
             with self.assertRaises(ValueError):
                 options(driver, True)
 
-    def test_prefill_only_and_default_off(self):
+    def test_prefill_only_and_default_automatic(self):
         generate = next(
             n
             for n in ast.parse((ADAPTERS / "hf_common.py").read_text()).body
@@ -127,7 +130,7 @@ class GemmaHeadRowTests(unittest.TestCase):
             generate.args.kw_defaults[
                 names.index("_generation_last_hidden_row_only")
             ].value,
-            False,
+            None,
         )
         calls = sorted(
             [

@@ -1835,9 +1835,13 @@ def decode_block_walk(result, num_generated, padded_len, eos_ids, tokenizer):
     return results
 
 
-def _generation_forward_options(run_forward_fn, last_hidden_row_only):
-    """Reject unsupported last-row requests before generation touches caches."""
-    if not last_hidden_row_only:
+def _generation_forward_options(run_forward_fn, last_hidden_row_only=None):
+    """Use the bounded head automatically when the driver supports it.
+
+    None selects automatically, False is a comparison opt-out, and an explicit
+    True still rejects an unsupported driver before generation touches caches.
+    """
+    if last_hidden_row_only is False:
         return {}
     parameter = inspect.signature(run_forward_fn).parameters.get(
         "_last_hidden_row_only"
@@ -1847,6 +1851,8 @@ def _generation_forward_options(run_forward_fn, last_hidden_row_only):
         inspect.Parameter.KEYWORD_ONLY,
     ):
         # A **kwargs-only driver could silently ignore this request.
+        if last_hidden_row_only is None:
+            return {}
         raise ValueError("The forward driver must declare _last_hidden_row_only")
     return {"_last_hidden_row_only": True}
 
@@ -1867,7 +1873,7 @@ def generate(
     top_p=None,
     eos_token_id=_UNSET,
     timing=False,
-    _generation_last_hidden_row_only=False,
+    _generation_last_hidden_row_only=None,
     **kwargs,
 ):
     """Model-agnostic generation from tokenized inputs with single-token decode.
