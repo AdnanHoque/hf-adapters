@@ -27,7 +27,7 @@ import torch
 SOURCE = Path(__file__).resolve().parents[2] / "hf_adapters/hf_gemma4_moe.py"
 
 
-def load(enabled):
+def load(enabled=None):
     names = {
         "_prefill_expert_config",
         "_validate_prefill_expert_inputs",
@@ -104,10 +104,36 @@ def test_default_arithmetic_and_hint_are_unchanged():
     }
 
 
-def test_opt_in_requests_each_measured_matmul_division():
+def test_source_default_is_automatic():
+    flag = next(
+        n
+        for n in ast.parse(SOURCE.read_text()).body
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "_PREFILL_EXPERT_DIVISIONS"
+            for t in n.targets
+        )
+    )
+    assert ast.literal_eval(flag.value) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "consumer_compatible_input_staging",
+        "read_copy_elision",
+        "lx_planner_relayout",
+    ],
+)
+def test_default_missing_capability_uses_ordinary_hints(name):
+    config = compiler_config()
+    delattr(config, name)
     observed = []
     original = torch.matmul
-    with hints() as active:
+    with with_config(config), hints() as active:
+        assert load()["_prefill_expert_config"]() == {
+            "allow_all_ops_in_lx_planning": True
+        }
 
         def multiply(a, b):
             division = {}
@@ -117,7 +143,63 @@ def test_opt_in_requests_each_measured_matmul_division():
             return original(a, b)
 
         with patch.object(torch, "matmul", multiply):
-            result = load(True)["_moe_expert_persistent"](*args())
+            load()["_moe_expert_persistent"](*args())
+    assert observed == [{"T": 32}] * 3
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("sencores", 16),
+        ("layout_solver", "cpsat"),
+        ("co_optimizing_lx_planning", True),
+        ("ktir_emitter", True),
+        ("ignore_work_division_hints", True),
+        ("ignore_wsr_hints", True),
+        ("lx_planning", False),
+    ],
+)
+def test_default_incompatible_config_uses_ordinary_path(name, value):
+    config = compiler_config()
+    setattr(config, name, value)
+    with with_config(config):
+        assert load()["_prefill_expert_config"]() == {
+            "allow_all_ops_in_lx_planning": True
+        }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"experts": 2},
+        {"tokens": 256},
+        {"hidden": 1408},
+        {"width": 768},
+        {"dtype": torch.bfloat16},
+    ],
+)
+def test_default_unsupported_shape_keeps_ordinary_arithmetic(overrides):
+    inputs = args(**overrides)
+    with hints(), patch.object(torch, "matmul", wraps=torch.matmul) as multiply:
+        result = load()["_moe_expert_persistent"](*inputs)
+    assert tuple(result.shape) == tuple(inputs[0].shape)
+    assert multiply.call_count == 3
+
+
+def test_automatic_default_requests_each_measured_matmul_division():
+    observed = []
+    original = torch.matmul
+    with with_config(compiler_config()), hints() as active:
+
+        def multiply(a, b):
+            division = {}
+            for hint in active:
+                division.update(hint.get("work_div", {}))
+            observed.append(division)
+            return original(a, b)
+
+        with patch.object(torch, "matmul", multiply):
+            result = load()["_moe_expert_persistent"](*args())
     assert tuple(result.shape) == (512, 2816)
     assert observed == [{"T": 8, "H": 4}, {"T": 8, "H": 4}, {"T": 16, "H": 2}]
 
@@ -141,6 +223,7 @@ def compiler_config():
     return SimpleNamespace(
         consumer_compatible_input_staging=False,
         read_copy_elision=False,
+        lx_planner_relayout=False,
         sencores=32,
         layout_solver="greedy",
         co_optimizing_lx_planning=False,
@@ -190,7 +273,8 @@ def test_incompatible_compiler_request_is_explicit(name, value):
 
 
 @pytest.mark.parametrize(
-    "name", ["consumer_compatible_input_staging", "read_copy_elision"]
+    "name",
+    ["consumer_compatible_input_staging", "read_copy_elision", "lx_planner_relayout"],
 )
 def test_missing_capability_is_explicit(name):
     config = compiler_config()
@@ -224,7 +308,7 @@ def test_existing_prefill_boundary_scopes_and_cleans_up_on_error():
 
     ns = {
         "_prefill_expert_config": lambda: {"sentinel": True},
-        "_validate_prefill_expert_inputs": lambda *a: None,
+        "_validate_prefill_expert_inputs": lambda *a: True,
         "_name_prefill_inputs": lambda *a: events.append("name"),
         "_reset_named_dims": lambda: events.append("reset"),
         "optional_spyre_config_patch": scope,

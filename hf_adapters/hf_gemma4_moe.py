@@ -39,23 +39,34 @@ __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
-# Private, default-off until the extracted compiler/adapter combination has
-# full-model acceptance. Requires the LX stack plus reader-compatible staging
-# and direct-weight-copy proofs; this is not a standalone schedule speedup.
-_PREFILL_EXPERT_DIVISIONS = False
+# Automatic for supported inputs and compilers. None selects automatically,
+# False is a comparison opt-out, True requires support before cache writes.
+# Requires the LX stack plus reader-compatible staging and direct-weight-copy
+# proofs; this is not a standalone schedule speedup.
+_PREFILL_EXPERT_DIVISIONS = None
 
 
 def _prefill_expert_config():
     """Require the measured compiler capabilities, scoped by the caller."""
     options = {"allow_all_ops_in_lx_planning": True}
-    if not _PREFILL_EXPERT_DIVISIONS:
+    if _PREFILL_EXPERT_DIVISIONS is False:
         return options
     from torch_spyre._inductor import config
 
     if not hasattr(config, "consumer_compatible_input_staging"):
-        raise RuntimeError("Prefill divisions require reader-compatible input staging")
+        if _PREFILL_EXPERT_DIVISIONS is True:
+            raise RuntimeError(
+                "Prefill divisions require reader-compatible input staging"
+            )
+        return options
     if not hasattr(config, "read_copy_elision"):
-        raise RuntimeError("Prefill divisions require direct weight-copy proofs")
+        if _PREFILL_EXPERT_DIVISIONS is True:
+            raise RuntimeError("Prefill divisions require direct weight-copy proofs")
+        return options
+    if not hasattr(config, "lx_planner_relayout"):
+        if _PREFILL_EXPERT_DIVISIONS is True:
+            raise RuntimeError("Prefill divisions require LX relayout support")
+        return options
     if (
         config.sencores != 32
         or config.layout_solver != "greedy"
@@ -65,10 +76,12 @@ def _prefill_expert_config():
         or config.ignore_wsr_hints
         or not config.lx_planning
     ):
-        raise RuntimeError(
-            "Prefill divisions require 32 cores, greedy LX planning, "
-            "honored hints and the SDSC path"
-        )
+        if _PREFILL_EXPERT_DIVISIONS is True:
+            raise RuntimeError(
+                "Prefill divisions require 32 cores, greedy LX planning, "
+                "honored hints and the SDSC path"
+            )
+        return options
     options.update(
         lx_planner_relayout=True,
         consumer_compatible_input_staging=True,
@@ -78,14 +91,14 @@ def _prefill_expert_config():
 
 
 def _validate_prefill_expert_inputs(x, gate, up, down, routing_weight=None):
-    """Reject an unsupported explicit schedule before any cache writes.
+    """Select supported inputs; reject unsupported explicit requests early.
 
     Forward sees [batch, tokens, hidden]; the expert region sees its flattened
     [rows, hidden] form. Check both without copying or reshaping device data.
     Routing is produced later, so its shape is checked again inside the region.
     """
-    if not _PREFILL_EXPERT_DIVISIONS:
-        return
+    if _PREFILL_EXPERT_DIVISIONS is False:
+        return False
     shape = tuple(x.shape)
     input_ok = shape == (512, 2816) or (
         routing_weight is None
@@ -107,9 +120,12 @@ def _validate_prefill_expert_inputs(x, gate, up, down, routing_weight=None):
             )
         )
     ):
-        raise ValueError(
-            "Prefill divisions are validated only for FP16 E128/T512/H2816/F704"
-        )
+        if _PREFILL_EXPERT_DIVISIONS is True:
+            raise ValueError(
+                "Prefill divisions are validated only for FP16 E128/T512/H2816/F704"
+            )
+        return False
+    return True
 
 
 def _name_prefill_inputs(x, gate, up, down):
@@ -245,26 +261,20 @@ def _moe_expert_persistent(x_expert, routing_weight, gate, up, down):
 
     experts, hidden, intermediate = gate.shape
 
-    _validate_prefill_expert_inputs(x_expert, gate, up, down, routing_weight)
+    use_divisions = _validate_prefill_expert_inputs(
+        x_expert, gate, up, down, routing_weight
+    ) and _prefill_expert_config().get("consumer_compatible_input_staging", False)
 
     x = x_expert.unsqueeze(0)
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = routing_weight.permute(1, 0, 2).contiguous().clone()
 
     with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": 32}):
-        with (
-            spyre_hint(work_div={"T": 8, "H": 4})
-            if _PREFILL_EXPERT_DIVISIONS
-            else nullcontext()
-        ):
+        with spyre_hint(work_div={"T": 8, "H": 4}) if use_divisions else nullcontext():
             gate_out = torch.matmul(x, gate)
             up_out = torch.matmul(x, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
-        with (
-            spyre_hint(work_div={"T": 16, "H": 2})
-            if _PREFILL_EXPERT_DIVISIONS
-            else nullcontext()
-        ):
+        with spyre_hint(work_div={"T": 16, "H": 2}) if use_divisions else nullcontext():
             down_out = torch.matmul(activated, down)
         return (down_out * route).sum(dim=0)
 
@@ -477,9 +487,10 @@ class Gemma4MoEBlock(nn.Module):
         )
         if hidden_states.shape[1] > 1:
             experts = self.experts
-            _validate_prefill_expert_inputs(
+            if not _validate_prefill_expert_inputs(
                 hidden_states, experts.gate_proj, experts.up_proj, experts.down_proj
-            )
+            ):
+                prefill_options = {"allow_all_ops_in_lx_planning": True}
             hidden_states, key_cache, value_cache = self._compiled_prefill_attn(
                 hidden_states,
                 selected_freqs,
