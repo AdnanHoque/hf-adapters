@@ -155,6 +155,8 @@ class DownBlockTests(unittest.TestCase):
         )
         self.assertIsNone(choose(2816, 704, (torch.float32,) * 4, True))
         self.assertIsNone(choose(2816, 704, (*fp16[:3], torch.float32), True))
+        # Each 16-bit format is supported, but mixing formats is not.
+        self.assertIsNone(choose(2816, 704, (*fp16[:3], torch.bfloat16), True))
         off = load_functions({"_decode_down_panel"}, _DECODE_DOWN_OUTPUT_PANEL=None)
         self.assertIsNone(off["_decode_down_panel"](2816, 704, fp16, True))
         invalid = load_functions({"_decode_down_panel"}, _DECODE_DOWN_OUTPUT_PANEL=123)
