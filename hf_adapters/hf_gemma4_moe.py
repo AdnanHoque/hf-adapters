@@ -37,6 +37,11 @@ __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
+# Private opt-in pending model numerical acceptance. The route assignment and
+# the compiler's indexed-selection layout are a measured pair: either alone
+# regressed this workload. Keep the compiler option scoped to decode calls.
+_DECODE_ROUTE_SCHEDULE = False
+
 
 def _name_prefill_inputs(x, gate, up, down):
     from torch_spyre._inductor.wsr.propagate_named_dims import (
@@ -97,6 +102,10 @@ def _compiled_moe_loop_region(
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
     T, H = x_expert.shape
+    if _DECODE_ROUTE_SCHEDULE and (T != 1 or top_k != 8):
+        raise ValueError(
+            "The decode route schedule requires one token and eight routes"
+        )
     probs = _router_probs(
         x_router,
         router_proj_w,
@@ -124,8 +133,13 @@ def _compiled_moe_loop_region(
         up = up_dev[expert_indices].reshape(rows, H, intermediate)
         down = down_dev[expert_indices].reshape(rows, intermediate, H)
 
-        gate_out = torch.bmm(inputs, gate)
-        up_out = torch.bmm(inputs, up)
+        if _DECODE_ROUTE_SCHEDULE:
+            with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
+                gate_out = torch.bmm(inputs, gate)
+                up_out = torch.bmm(inputs, up)
+        else:
+            gate_out = torch.bmm(inputs, gate)
+            up_out = torch.bmm(inputs, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
         expert_out = torch.bmm(activated, down).reshape(T, top_k, H)
 
@@ -405,6 +419,22 @@ class Gemma4MoEBlock(nn.Module):
                 hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
             _reset_named_dims()
         else:
+            if _DECODE_ROUTE_SCHEDULE:
+                # Requires Torch-Spyre's indexed-selection layout capability.
+                # An older compiler rejects the explicit option rather than
+                # silently running the slower route-only configuration.
+                with optional_spyre_config_patch(
+                    {"indexed_selection_consumer_layout": True}
+                ):
+                    return self._compiled_decode(
+                        hidden_states,
+                        selected_freqs,
+                        attn_mask,
+                        key_cache,
+                        value_cache,
+                        cache_index,
+                        layer_scalar,
+                    )
             hidden_states, key_cache, value_cache = self._compiled_decode(
                 hidden_states,
                 selected_freqs,
