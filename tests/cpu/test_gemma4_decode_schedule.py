@@ -23,12 +23,12 @@ from _gemma4_decode_perf_helpers import load_functions, recorded_hints
 
 
 class GemmaDecodeScheduleTests(unittest.TestCase):
-    def run_region(self, enabled, tokens=1, routes=8):
+    def run_region(self, enabled=None, tokens=1, routes=8, compiler_capability=True):
         ids = torch.tensor([[0, 0, 1, 3, 7, 7, 4, 6]])[:, :routes].expand(tokens, -1)
         weights = torch.ones(tokens, routes, dtype=torch.float64)
         namespace = load_functions(
             {"_compiled_moe_loop_region"},
-            _DECODE_ROUTE_SCHEDULE=enabled,
+            **({} if enabled is None else {"_DECODE_ROUTE_SCHEDULE": enabled}),
             _router_probs=lambda *args: weights,
             _topk=lambda *args: (weights, ids),
         )
@@ -36,7 +36,7 @@ class GemmaDecodeScheduleTests(unittest.TestCase):
         gate = (torch.arange(8 * 4 * 3).reshape(8, 4, 3) % 7).double() / 16
         up = gate + 0.25
         down = gate.transpose(1, 2).contiguous()
-        with recorded_hints() as hints:
+        with recorded_hints(compiler_capability=compiler_capability) as hints:
             result = namespace["_compiled_moe_loop_region"](
                 x,
                 x,
@@ -56,7 +56,7 @@ class GemmaDecodeScheduleTests(unittest.TestCase):
 
     def test_default_and_r8_have_equal_cpu_arithmetic_with_repeated_ids(self):
         ordinary, default_hints = self.run_region(False)
-        routed, routed_hints = self.run_region(True)
+        routed, routed_hints = self.run_region()
         self.assertTrue(torch.equal(ordinary, routed))
         self.assertFalse([h for h in default_hints if "work_div" in h])
         self.assertEqual(
@@ -66,10 +66,17 @@ class GemmaDecodeScheduleTests(unittest.TestCase):
     def test_unsupported_token_and_route_counts_decline(self):
         for tokens, routes in ((2, 8), (1, 3)):
             with self.subTest(tokens=tokens, routes=routes):
-                with self.assertRaisesRegex(ValueError, "one token and eight routes"):
-                    self.run_region(True, tokens, routes)
-                result, _ = self.run_region(False, tokens, routes)
+                result, hints = self.run_region(None, tokens, routes)
+                ordinary, _ = self.run_region(False, tokens, routes)
+                self.assertTrue(torch.equal(result, ordinary))
+                self.assertFalse([h for h in hints if "work_div" in h])
                 self.assertEqual(result.shape, (tokens, 4))
+
+    def test_old_compiler_retains_ordinary_schedule(self):
+        result, hints = self.run_region(compiler_capability=False)
+        ordinary, _ = self.run_region(False)
+        self.assertTrue(torch.equal(result, ordinary))
+        self.assertFalse([h for h in hints if "work_div" in h])
 
     def test_compiler_option_is_scoped_and_restored_on_error(self):
         active, observed = {}, []
@@ -93,23 +100,24 @@ class GemmaDecodeScheduleTests(unittest.TestCase):
             _DECODE_ROUTE_SCHEDULE=True,
             optional_spyre_config_patch=patch_options,
         )
-        block = SimpleNamespace(_compiled_decode=decode)
-        with self.assertRaisesRegex(RuntimeError, "test failure"):
+        block = SimpleNamespace(_compiled_decode=decode, _moe_k=8)
+        with recorded_hints(), self.assertRaisesRegex(RuntimeError, "test failure"):
             namespace["forward"](
                 block, torch.zeros(1, 1, 4), None, None, None, None, None, None
             )
         self.assertEqual(observed, [{"indexed_selection_consumer_layout": True}])
         self.assertEqual(active, {})
 
-    def test_default_decode_does_not_touch_compiler_configuration(self):
+    def test_opt_out_does_not_touch_compiler_configuration(self):
         namespace = load_functions(
             {"forward"},
+            _DECODE_ROUTE_SCHEDULE=False,
             optional_spyre_config_patch=lambda options: self.fail(
                 "default patched config"
             ),
         )
         expected = (object(), object(), object())
-        block = SimpleNamespace(_compiled_decode=lambda *args: expected)
+        block = SimpleNamespace(_compiled_decode=lambda *args: expected, _moe_k=8)
         self.assertEqual(
             namespace["forward"](
                 block, torch.zeros(1, 1, 4), None, None, None, None, None, None

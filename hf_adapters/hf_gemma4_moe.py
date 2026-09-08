@@ -39,10 +39,24 @@ __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
-# Private opt-in pending model numerical acceptance. The route assignment and
+# Enabled automatically for supported decode calls. The route assignment and
 # the compiler's indexed-selection layout are a measured pair: either alone
 # regressed this workload. Keep the compiler option scoped to decode calls.
-_DECODE_ROUTE_SCHEDULE = False
+_DECODE_ROUTE_SCHEDULE = True
+
+
+def _decode_route_schedule_enabled(tokens, top_k):
+    """Pair R8 with its compiler capability; other shapes use ordinary decode."""
+    if not _DECODE_ROUTE_SCHEDULE or tokens != 1 or top_k != 8:
+        return False
+    from torch_spyre._inductor import config
+
+    return (
+        hasattr(config, "indexed_selection_consumer_layout")
+        and config.sencores == 32
+        and not config.ignore_work_division_hints
+        and not config.ignore_wsr_hints
+    )
 
 
 def _name_prefill_inputs(x, gate, up, down):
@@ -104,10 +118,7 @@ def _compiled_moe_loop_region(
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
     T, H = x_expert.shape
-    if _DECODE_ROUTE_SCHEDULE and (T != 1 or top_k != 8):
-        raise ValueError(
-            "The decode route schedule requires one token and eight routes"
-        )
+    route_schedule = _decode_route_schedule_enabled(T, top_k)
     probs = _router_probs(
         x_router,
         router_proj_w,
@@ -135,7 +146,7 @@ def _compiled_moe_loop_region(
         up = up_dev[expert_indices].reshape(rows, H, intermediate)
         down = down_dev[expert_indices].reshape(rows, intermediate, H)
 
-        if _DECODE_ROUTE_SCHEDULE:
+        if route_schedule:
             with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
                 gate_out = torch.bmm(inputs, gate)
                 up_out = torch.bmm(inputs, up)
@@ -421,12 +432,13 @@ class Gemma4MoEBlock(nn.Module):
                 hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
             _reset_named_dims()
         else:
-            # Requires Torch-Spyre's indexed-selection layout capability.
-            # An older compiler rejects the explicit option rather than
-            # silently running the slower route-only configuration.
+            # Do not enable the slower route-only configuration on an older
+            # compiler. Both the wrapper and region use this same eligibility.
             decode_config = (
                 optional_spyre_config_patch({"indexed_selection_consumer_layout": True})
-                if _DECODE_ROUTE_SCHEDULE
+                if _decode_route_schedule_enabled(
+                    hidden_states.shape[0] * hidden_states.shape[1], self._moe_k
+                )
                 else nullcontext()
             )
             with decode_config:
