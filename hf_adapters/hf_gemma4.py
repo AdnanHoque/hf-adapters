@@ -763,7 +763,9 @@ def _run_forward(
 
     The default returns every row. The opt-in leaves the backbone and all
     cache updates intact, selecting a row before the existing vocabulary head
-    and softcap. A differently shaped matmul may round differently; this is
+    and softcap. Chunked generation requests one head row for each chunk,
+    while every chunk still runs its complete backbone and cache updates.
+    A differently shaped matmul may round differently; this is
     not a promise of bitwise equality to the full-row device calculation.
     """
     h = _run_backbone_forward(
