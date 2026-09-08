@@ -41,7 +41,124 @@ def load_function(filename, name, namespace):
     return namespace[name]
 
 
+def run_prefill_branch(source, namespace):
+    """Execute the shipped prefill branch, not a second generation loop."""
+    parsed = ast.parse(source.read_text())
+    generate = next(n for n in parsed.body if getattr(n, "name", "") == "generate")
+    branch = next(
+        n
+        for n in ast.walk(generate)
+        if isinstance(n, ast.If) and ast.unparse(n.test) == "i == 0"
+    )
+    setup = [
+        n
+        for n in generate.body
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id in {"prefill_driver", "forward_row_kwargs"}
+            for t in n.targets
+        )
+    ]
+    ns = {
+        "torch": torch,
+        "DEVICE": "cpu",
+        "model": object(),
+        "input_ids": torch.arange(128).reshape(1, 128),
+        "position_ids": torch.arange(128).reshape(1, 128),
+        "batch_size": 1,
+        "padded_len": 128,
+        "prefill_kv_len": 128,
+        "query_chunk_size": 64,
+        "chunked_prefill": True,
+        "prompt_offsets": torch.tensor([0]),
+        "model_d_type": torch.float32,
+        "key_caches": [object()],
+        "value_caches": [object()],
+        "_prefill_cache_inputs": lambda caches, *args: caches,
+        "build_prefill_mask": lambda *args, **kwargs: torch.zeros(1),
+        "make_cache_index": lambda start, length, *args: torch.arange(
+            start, start + length
+        ),
+        "prefill_fn": None,
+        "run_forward_fn": None,
+        "normalized_token_inputs": {},
+        "_generation_last_hidden_row_only": None,
+        "_prefill_last_row_only": True,
+    }
+    ns.update(namespace)
+    exec(
+        compile(ast.Module(setup + branch.body, type_ignores=[]), str(source), "exec"),
+        ns,
+    )
+    return ns
+
+
 class GemmaHeadRowTests(unittest.TestCase):
+    def test_actual_prefill_driver_gets_request_and_retains_cache_inputs(self):
+        for callback in (False, True):
+            with self.subTest(callback=callback):
+                seen = []
+
+                def forward(
+                    model, input_ids, *args, _last_hidden_row_only=False, **kwargs
+                ):
+                    seen.append(
+                        (input_ids.shape[1], _last_hidden_row_only, args, kwargs)
+                    )
+                    rows = input_ids[:, -1:] if _last_hidden_row_only else input_ids
+                    return rows[..., None].expand(-1, -1, 11).float()
+
+                options = load_function(
+                    "hf_common.py", "_generation_forward_options", {"inspect": inspect}
+                )
+                ns = run_prefill_branch(
+                    ADAPTERS / "hf_common.py",
+                    {
+                        "run_forward_fn": None if callback else forward,
+                        "prefill_fn": forward if callback else None,
+                        "_generation_forward_options": options,
+                    },
+                )
+                self.assertEqual(
+                    [(n, flag) for n, flag, _, _ in seen],
+                    [(128, True)] if callback else [(64, True), (64, True)],
+                )
+                for _, _, args, kwargs in seen:
+                    self.assertIs(
+                        kwargs["key_caches"] if callback else args[2], ns["key_caches"]
+                    )
+                    self.assertIs(
+                        kwargs["value_caches"] if callback else args[3],
+                        ns["value_caches"],
+                    )
+                self.assertTrue(
+                    torch.equal(ns["next_logits"], torch.full((1, 11), 127.0))
+                )
+                self.assertEqual(ns["current_cache_len"], 128)
+
+    def test_unsupported_prefill_callback_ignores_unused_supported_text_driver(self):
+        def unused(*args, _last_hidden_row_only=False):
+            raise AssertionError("Custom prefill owns this path")
+
+        def callback(**kwargs):
+            self.assertNotIn("_last_hidden_row_only", kwargs)
+            return torch.zeros(1, 128, 11)
+
+        options = load_function(
+            "hf_common.py", "_generation_forward_options", {"inspect": inspect}
+        )
+        ns = {
+            "prefill_fn": callback,
+            "run_forward_fn": unused,
+            "_generation_forward_options": options,
+        }
+        run_prefill_branch(ADAPTERS / "hf_common.py", ns)
+        with self.assertRaisesRegex(ValueError, "must declare"):
+            run_prefill_branch(
+                ADAPTERS / "hf_common.py",
+                {**ns, "_generation_last_hidden_row_only": True},
+            )
+
     def test_row_identity_backbone_cache_arguments_and_softcap(self):
         for cap in (None, 30.0):
             with self.subTest(cap=cap):
@@ -113,7 +230,7 @@ class GemmaHeadRowTests(unittest.TestCase):
         self.assertEqual(options(supported, True), {"_last_hidden_row_only": True})
         self.assertEqual(options(supported), {"_last_hidden_row_only": True})
         self.assertEqual(options(supported, False), {})
-        for driver in (swallowed, positional, same_name_kwargs):
+        for driver in (None, swallowed, positional, same_name_kwargs):
             self.assertEqual(options(driver), {})
             self.assertEqual(options(driver, False), {})
             with self.assertRaises(ValueError):
