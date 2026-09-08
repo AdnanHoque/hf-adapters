@@ -64,7 +64,9 @@ def _decode_down_output_blocks(activated, down_bank, expert_indices, block_size)
         selected = down_bank[:, :, start : start + width][expert_indices].reshape(
             rows, intermediate, width
         )
-        with spyre_hint(named_dims=["R", "ONE", "H"], work_div={"R": 8, "H": 1}):
+        # The indexed load keeps data columns unsplit on this compiler. H:4
+        # needs a proven distributed load or explicit transfer, not a new hint.
+        with spyre_hint(named_dims=["R", "ONE", "H"], work_div={"R": rows, "H": 1}):
             outputs.append(torch.bmm(activated, selected))
     return torch.cat(outputs, dim=-1)
 

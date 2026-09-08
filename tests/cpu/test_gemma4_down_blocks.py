@@ -80,7 +80,7 @@ class DownBlockTests(unittest.TestCase):
             if isinstance(n, ast.If)
             and ast.unparse(n.test) == "_DECODE_DOWN_OUTPUT_PANEL is None"
         ]
-        self.assertEqual(len(guards), 1)
+        self.assertGreaterEqual(len(guards), 1)
         full_reads = [
             n
             for n in ast.walk(region)
@@ -88,9 +88,16 @@ class DownBlockTests(unittest.TestCase):
             and isinstance(n.value, ast.Name)
             and n.value.id == "down_dev"
         ]
-        self.assertEqual(len(full_reads), 1)
-        self.assertIn(full_reads[0], list(ast.walk(guards[0])))
-        self.assertNotIn("_DECODE_GATE_UP_K_PANEL", ast.unparse(region))
+        self.assertTrue(full_reads)
+        # A later gate/up-blocking PR can add another ordinary-down branch.
+        # Every such read must remain guarded, not just the first one found.
+        guarded_nodes = [
+            node
+            for guard in guards
+            for statement in guard.body
+            for node in ast.walk(statement)
+        ]
+        self.assertTrue(all(read in guarded_nodes for read in full_reads))
 
     def test_explicit_request_without_route_schedule_declines(self):
         namespace = load_functions(
