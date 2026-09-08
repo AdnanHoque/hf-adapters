@@ -50,6 +50,13 @@ def load_functions(names, **overrides):
     ]
     if len(nodes) != len(names):
         raise AssertionError(f"Expected exactly the requested functions: {names}")
+    nodes += [
+        n
+        for n in parsed.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in {"_decode_route_schedule_enabled", "_decode_gate_up_panel"}
+        and n.name not in names
+    ]
     exec(
         compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace
     )
@@ -57,7 +64,7 @@ def load_functions(names, **overrides):
 
 
 @contextlib.contextmanager
-def recorded_hints():
+def recorded_hints(*, compiler_capability=True):
     calls = []
 
     @contextlib.contextmanager
@@ -67,5 +74,15 @@ def recorded_hints():
 
     module = ModuleType("torch_spyre._inductor.propagate_hints")
     module.spyre_hint = spyre_hint
-    with patch.dict(sys.modules, {module.__name__: module}):
+    config = ModuleType("torch_spyre._inductor.config")
+    config.sencores = 32
+    config.ignore_work_division_hints = False
+    config.ignore_wsr_hints = False
+    if compiler_capability:
+        config.indexed_selection_consumer_layout = False
+    inductor = ModuleType("torch_spyre._inductor")
+    inductor.config = config
+    with patch.dict(
+        sys.modules, {module.__name__: module, inductor.__name__: inductor}
+    ):
         yield calls

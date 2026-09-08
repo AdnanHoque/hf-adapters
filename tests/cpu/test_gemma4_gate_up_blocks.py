@@ -67,7 +67,7 @@ class GateUpBlockTests(unittest.TestCase):
             n
             for n in ast.walk(region)
             if isinstance(n, ast.If)
-            and ast.unparse(n.test) == "_DECODE_GATE_UP_K_PANEL is not None"
+            and ast.unparse(n.test) == "gate_up_panel is not None"
         )
         full_reads = [
             n
@@ -80,29 +80,62 @@ class GateUpBlockTests(unittest.TestCase):
         ordinary = list(ast.walk(ast.Module(body=branch.orelse, type_ignores=[])))
         self.assertTrue(all(n in ordinary for n in full_reads))
 
-    def test_explicit_request_without_route_schedule_declines(self):
-        namespace = load_functions(
-            {"_compiled_moe_loop_region"}, _DECODE_GATE_UP_K_PANEL=704
+    def test_default_region_uses_blocks_without_a_feature_override(self):
+        # Meta tensors exercise shipped dispatch and all BMM shapes without
+        # allocating the full bank. Numerical device acceptance is separate.
+        def make(*shape):
+            return torch.empty(shape, device="meta", dtype=torch.float16)
+
+        ids = torch.empty((1, 8), device="meta", dtype=torch.int64)
+        weights = make(1, 8)
+        ns = load_functions(
+            {"_compiled_moe_loop_region", "_decode_gate_up_blocks"},
+            _router_probs=lambda *args: weights,
+            _topk=lambda *args: (weights, ids),
         )
-        with (
-            recorded_hints(),
-            self.assertRaisesRegex(ValueError, "Gate/up blocks require"),
-        ):
-            namespace["_compiled_moe_loop_region"](
+        shapes = []
+        bmm = torch.bmm
+
+        def record_bmm(x, y):
+            shapes.append((tuple(x.shape), tuple(y.shape)))
+            return bmm(x, y)
+
+        x = make(1, 2816)
+        with recorded_hints(), patch.object(torch, "bmm", record_bmm):
+            result = ns["_compiled_moe_loop_region"](
+                x,
+                x,
                 None,
-                torch.zeros(1, 4),
                 None,
                 None,
-                None,
-                None,
-                torch.empty(8, 4, 3),
-                None,
-                None,
+                make(128, 64),
+                make(128, 2816, 704),
+                make(128, 2816, 704),
+                make(128, 704, 2816),
                 8,
                 32,
-                2,
+                64,
                 1e-6,
             )
+        self.assertEqual(tuple(result.shape), (1, 2816))
+        self.assertEqual(len(shapes), 9)
+        self.assertEqual([shape[1][-1] for shape in shapes], [704] * 8 + [2816])
+        self.assertTrue(all(shape[0][0:2] == (8, 1) for shape in shapes))
+
+    def test_default_panel_and_supported_shape_fallbacks(self):
+        choose = load_functions({"_decode_gate_up_panel"})["_decode_gate_up_panel"]
+        fp16 = (torch.float16,) * 4
+        self.assertEqual(choose(2816, 704, fp16, True), 704)
+        self.assertIsNone(choose(2816, 704, fp16, False))
+        self.assertIsNone(choose(1408, 704, fp16, True))
+        self.assertIsNone(choose(2816, 768, fp16, True))
+        self.assertIsNone(choose(2816, 704, (torch.bfloat16,) * 4, True))
+        self.assertIsNone(choose(2816, 704, (*fp16[:3], torch.float32), True))
+        off = load_functions({"_decode_gate_up_panel"}, _DECODE_GATE_UP_K_PANEL=None)
+        self.assertIsNone(off["_decode_gate_up_panel"](2816, 704, fp16, True))
+        invalid = load_functions({"_decode_gate_up_panel"}, _DECODE_GATE_UP_K_PANEL=123)
+        with self.assertRaisesRegex(ValueError, "Unsupported decode block width"):
+            invalid["_decode_gate_up_panel"](2816, 704, fp16, True)
 
 
 if __name__ == "__main__":
