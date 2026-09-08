@@ -43,6 +43,30 @@ _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 # the compiler's indexed-selection layout are a measured pair: either alone
 # regressed this workload. Keep the compiler option scoped to decode calls.
 _DECODE_ROUTE_SCHEDULE = False
+# Independent of gate/up reduction blocking. The measured opt-in is 1024;
+# smaller widths and intermediate-retention experiments are not shipped.
+_DECODE_DOWN_OUTPUT_PANEL = None
+
+
+def _decode_down_output_blocks(activated, down_bank, expert_indices, block_size):
+    """Select output-column blocks before indexing the original expert bank.
+
+    Every output still sums its full reduction dimension in one BMM. Concatenate
+    columns in order; never concatenate weights into a full selected slab.
+    """
+    from torch_spyre._inductor.propagate_hints import spyre_hint
+
+    rows, _, intermediate = activated.shape
+    hidden = down_bank.shape[-1]
+    outputs = []
+    for start in range(0, hidden, block_size):
+        width = min(block_size, hidden - start)
+        selected = down_bank[:, :, start : start + width][expert_indices].reshape(
+            rows, intermediate, width
+        )
+        with spyre_hint(named_dims=["R", "ONE", "H"], work_div={"R": 8, "H": 1}):
+            outputs.append(torch.bmm(activated, selected))
+    return torch.cat(outputs, dim=-1)
 
 
 def _name_prefill_inputs(x, gate, up, down):
@@ -108,6 +132,13 @@ def _compiled_moe_loop_region(
         raise ValueError(
             "The decode route schedule requires one token and eight routes"
         )
+    if _DECODE_DOWN_OUTPUT_PANEL is not None and (
+        not _DECODE_ROUTE_SCHEDULE
+        or _DECODE_DOWN_OUTPUT_PANEL != 1024
+        or H != 2816
+        or gate_dev.shape[-1] != 704
+    ):
+        raise ValueError("Down blocks require the Gemma4 R8 decode shape and width 1024")
     probs = _router_probs(
         x_router,
         router_proj_w,
@@ -133,7 +164,8 @@ def _compiled_moe_loop_region(
         )
         gate = gate_dev[expert_indices].reshape(rows, H, intermediate)
         up = up_dev[expert_indices].reshape(rows, H, intermediate)
-        down = down_dev[expert_indices].reshape(rows, intermediate, H)
+        if _DECODE_DOWN_OUTPUT_PANEL is None:
+            down = down_dev[expert_indices].reshape(rows, intermediate, H)
 
         if _DECODE_ROUTE_SCHEDULE:
             with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
@@ -143,7 +175,13 @@ def _compiled_moe_loop_region(
             gate_out = torch.bmm(inputs, gate)
             up_out = torch.bmm(inputs, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
-        expert_out = torch.bmm(activated, down).reshape(T, top_k, H)
+        if _DECODE_DOWN_OUTPUT_PANEL is not None:
+            expert_out = _decode_down_output_blocks(
+                activated, down_dev, expert_indices, _DECODE_DOWN_OUTPUT_PANEL
+            )
+        else:
+            expert_out = torch.bmm(activated, down)
+        expert_out = expert_out.reshape(T, top_k, H)
 
         # Scale on the H-carrying tensor because bare [T,K] products have no
         # legal layout. The widened source gives the gather a physical stick.
