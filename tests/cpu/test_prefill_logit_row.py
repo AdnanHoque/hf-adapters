@@ -40,6 +40,58 @@ def load_helper():
     return namespace[function.name]
 
 
+def run_prefill_branch(source, namespace):
+    """Execute the shipped prefill branch, not a second generation loop."""
+    parsed = ast.parse(source.read_text())
+    generate = next(n for n in parsed.body if getattr(n, "name", "") == "generate")
+    branch = next(
+        n
+        for n in ast.walk(generate)
+        if isinstance(n, ast.If) and ast.unparse(n.test) == "i == 0"
+    )
+    setup = [
+        n
+        for n in generate.body
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id in {"prefill_driver", "forward_row_kwargs"}
+            for t in n.targets
+        )
+    ]
+    ns = {
+        "torch": torch,
+        "DEVICE": "cpu",
+        "model": object(),
+        "input_ids": torch.arange(128).reshape(1, 128),
+        "position_ids": torch.arange(128).reshape(1, 128),
+        "batch_size": 1,
+        "padded_len": 128,
+        "prefill_kv_len": 128,
+        "query_chunk_size": 64,
+        "chunked_prefill": True,
+        "prompt_offsets": torch.tensor([0]),
+        "model_d_type": torch.float32,
+        "key_caches": [object()],
+        "value_caches": [object()],
+        "_prefill_cache_inputs": lambda caches, *args: caches,
+        "build_prefill_mask": lambda *args, **kwargs: torch.zeros(1),
+        "make_cache_index": lambda start, length, *args: torch.arange(
+            start, start + length
+        ),
+        "prefill_fn": None,
+        "run_forward_fn": None,
+        "normalized_token_inputs": {},
+        "_generation_last_hidden_row_only": None,
+        "_prefill_last_row_only": True,
+    }
+    ns.update(namespace)
+    exec(
+        compile(ast.Module(setup + branch.body, type_ignores=[]), str(source), "exec"),
+        ns,
+    )
+    return ns
+
+
 class TrackedTensor:
     def __init__(self, value, events):
         self.value = value
@@ -58,6 +110,31 @@ class TrackedTensor:
 
 
 class PrefillLogitRowTests(unittest.TestCase):
+    def test_chunked_and_callback_prefill_copy_only_the_final_row(self):
+        for callback in (False, True):
+            with self.subTest(callback=callback):
+                events, seen = [], []
+
+                def forward(model, input_ids, *args, **kwargs):
+                    seen.append(input_ids.clone())
+                    logits = input_ids[..., None].expand(-1, -1, 11).float()
+                    return TrackedTensor(logits, events)
+
+                ns = run_prefill_branch(
+                    SOURCE,
+                    {
+                        "run_forward_fn": None if callback else forward,
+                        "prefill_fn": forward if callback else None,
+                        "_prefill_next_logits": load_helper(),
+                    },
+                )
+                self.assertEqual(len(seen), 1 if callback else 2)
+                self.assertEqual(events, [("clone", (1, 1, 11)), ("cpu", (1, 1, 11))])
+                self.assertTrue(
+                    torch.equal(ns["next_logits"].value, torch.full((1, 11), 127.0))
+                )
+                self.assertEqual(ns["current_cache_len"], 128)
+
     def test_last_row_exact_for_multiple_batches_and_dtypes(self):
         helper = load_helper()
         for dtype in (torch.float32, torch.bfloat16):
