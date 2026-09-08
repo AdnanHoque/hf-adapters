@@ -59,6 +59,51 @@ def _decode_route_schedule_enabled(tokens, top_k):
     )
 
 
+# Independent of gate/up reduction blocking. Enabled at width 1024;
+# smaller widths and intermediate-retention experiments are not shipped.
+_DECODE_DOWN_OUTPUT_PANEL = 1024
+
+
+def _decode_down_output_blocks(activated, down_bank, expert_indices, block_size):
+    """Select output-column blocks before indexing the original expert bank.
+
+    Every output still sums its full reduction dimension in one BMM. Concatenate
+    columns in order; never concatenate weights into a full selected slab.
+    """
+    from torch_spyre._inductor.propagate_hints import spyre_hint
+
+    rows, _, intermediate = activated.shape
+    hidden = down_bank.shape[-1]
+    outputs = []
+    for start in range(0, hidden, block_size):
+        width = min(block_size, hidden - start)
+        selected = down_bank[:, :, start : start + width][expert_indices].reshape(
+            rows, intermediate, width
+        )
+        # The indexed load keeps data columns unsplit on this compiler. H:4
+        # needs a proven distributed load or explicit transfer, not a new hint.
+        with spyre_hint(named_dims=["R", "ONE", "H"], work_div={"R": rows, "H": 1}):
+            outputs.append(torch.bmm(activated, selected))
+    return torch.cat(outputs, dim=-1)
+
+
+def _decode_down_panel(hidden, intermediate, dtypes, route_schedule):
+    """Choose the measured block width only for its supported decode shape."""
+    if _DECODE_DOWN_OUTPUT_PANEL not in (None, 1024):
+        raise ValueError("Unsupported decode block width; expected 1024 or None")
+    if (
+        route_schedule
+        and hidden == 2816
+        and intermediate == 704
+        # Both host formats use SEN169_FP16 device arithmetic/storage.
+        # Gemma's checkpoint uses bfloat16; float32 is a different device path.
+        and dtypes[0] in (torch.float16, torch.bfloat16)
+        and all(dtype == dtypes[0] for dtype in dtypes)
+    ):
+        return _DECODE_DOWN_OUTPUT_PANEL
+    return None
+
+
 # Enabled for supported decode: four 704-term partial sums replace a 2816-term dot product.
 # This changes addition grouping and requires separate numerical acceptance.
 _DECODE_GATE_UP_K_PANEL = 704
@@ -168,6 +213,12 @@ def _compiled_moe_loop_region(
 
     T, H = x_expert.shape
     route_schedule = _decode_route_schedule_enabled(T, top_k)
+    down_panel = _decode_down_panel(
+        H,
+        gate_dev.shape[-1],
+        (x_expert.dtype, gate_dev.dtype, up_dev.dtype, down_dev.dtype),
+        route_schedule,
+    )
     gate_up_panel = _decode_gate_up_panel(
         H,
         gate_dev.shape[-1],
@@ -197,15 +248,15 @@ def _compiled_moe_loop_region(
         inputs = (
             x_expert[:, None, :].expand(T, top_k, H).contiguous().reshape(rows, 1, H)
         )
-        if gate_up_panel is not None:
+        if down_panel is None:
             down = down_dev[expert_indices].reshape(rows, intermediate, H)
+        if gate_up_panel is not None:
             gate_out, up_out = _decode_gate_up_blocks(
                 inputs, gate_dev, up_dev, expert_indices, gate_up_panel
             )
         else:
             gate = gate_dev[expert_indices].reshape(rows, H, intermediate)
             up = up_dev[expert_indices].reshape(rows, H, intermediate)
-            down = down_dev[expert_indices].reshape(rows, intermediate, H)
             if route_schedule:
                 with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
                     gate_out = torch.bmm(inputs, gate)
@@ -214,7 +265,13 @@ def _compiled_moe_loop_region(
                 gate_out = torch.bmm(inputs, gate)
                 up_out = torch.bmm(inputs, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
-        expert_out = torch.bmm(activated, down).reshape(T, top_k, H)
+        if down_panel is not None:
+            expert_out = _decode_down_output_blocks(
+                activated, down_dev, expert_indices, down_panel
+            )
+        else:
+            expert_out = torch.bmm(activated, down)
+        expert_out = expert_out.reshape(T, top_k, H)
 
         # Scale on the H-carrying tensor because bare [T,K] products have no
         # legal layout. The widened source gives the gather a physical stick.

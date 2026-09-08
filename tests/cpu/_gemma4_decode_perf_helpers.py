@@ -54,7 +54,14 @@ def load_functions(names, **overrides):
         n
         for n in parsed.body
         if isinstance(n, ast.FunctionDef)
-        and n.name in {"_decode_route_schedule_enabled", "_decode_gate_up_panel"}
+        and n.name
+        in {
+            "_decode_route_schedule_enabled",
+            "_decode_down_panel",
+            "_decode_gate_up_panel",
+            "_decode_down_output_blocks",
+            "_decode_gate_up_blocks",
+        }
         and n.name not in names
     ]
     exec(
