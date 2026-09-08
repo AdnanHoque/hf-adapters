@@ -32,7 +32,11 @@ SOURCE = Path(__file__).resolve().parents[2] / "hf_adapters/hf_gemma4_moe.py"
 
 def load_functions(names, **overrides):
     parsed = ast.parse(SOURCE.read_text())
-    namespace = {"torch": torch, "F": torch.nn.functional}
+    namespace = {
+        "torch": torch,
+        "F": torch.nn.functional,
+        "nullcontext": contextlib.nullcontext,
+    }
     for node in parsed.body:
         if isinstance(node, ast.Assign):
             for name in node.targets:

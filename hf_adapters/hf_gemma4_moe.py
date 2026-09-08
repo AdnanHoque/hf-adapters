@@ -19,6 +19,8 @@ evaluating every expert; single-token decode gathers only the selected experts.
 Both paths share one device-resident expert-weight set.
 """
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -419,31 +421,24 @@ class Gemma4MoEBlock(nn.Module):
                 hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
             _reset_named_dims()
         else:
-            if _DECODE_ROUTE_SCHEDULE:
-                # Requires Torch-Spyre's indexed-selection layout capability.
-                # An older compiler rejects the explicit option rather than
-                # silently running the slower route-only configuration.
-                with optional_spyre_config_patch(
-                    {"indexed_selection_consumer_layout": True}
-                ):
-                    return self._compiled_decode(
-                        hidden_states,
-                        selected_freqs,
-                        attn_mask,
-                        key_cache,
-                        value_cache,
-                        cache_index,
-                        layer_scalar,
-                    )
-            hidden_states, key_cache, value_cache = self._compiled_decode(
-                hidden_states,
-                selected_freqs,
-                attn_mask,
-                key_cache,
-                value_cache,
-                cache_index,
-                layer_scalar,
+            # Requires Torch-Spyre's indexed-selection layout capability.
+            # An older compiler rejects the explicit option rather than
+            # silently running the slower route-only configuration.
+            decode_config = (
+                optional_spyre_config_patch({"indexed_selection_consumer_layout": True})
+                if _DECODE_ROUTE_SCHEDULE
+                else nullcontext()
             )
+            with decode_config:
+                hidden_states, key_cache, value_cache = self._compiled_decode(
+                    hidden_states,
+                    selected_freqs,
+                    attn_mask,
+                    key_cache,
+                    value_cache,
+                    cache_index,
+                    layer_scalar,
+                )
 
         return hidden_states, key_cache, value_cache
 
