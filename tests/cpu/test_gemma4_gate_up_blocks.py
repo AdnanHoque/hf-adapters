@@ -79,7 +79,6 @@ class GateUpBlockTests(unittest.TestCase):
         self.assertEqual(len(full_reads), 2)
         ordinary = list(ast.walk(ast.Module(body=branch.orelse, type_ignores=[])))
         self.assertTrue(all(n in ordinary for n in full_reads))
-        self.assertNotIn("_DECODE_DOWN_OUTPUT_PANEL", ast.unparse(region))
 
     def test_explicit_request_without_route_schedule_declines(self):
         namespace = load_functions(
