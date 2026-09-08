@@ -43,6 +43,36 @@ _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 # the compiler's indexed-selection layout are a measured pair: either alone
 # regressed this workload. Keep the compiler option scoped to decode calls.
 _DECODE_ROUTE_SCHEDULE = False
+# Private opt-in: four 704-term partial sums replace a 2816-term dot product.
+# This changes addition grouping and requires separate numerical acceptance.
+_DECODE_GATE_UP_K_PANEL = None
+
+
+def _decode_gate_up_blocks(inputs, gate_bank, up_bank, expert_indices, block_size):
+    """Load and consume one gate/up block at a time from unchanged banks."""
+    from torch_spyre._inductor.propagate_hints import spyre_hint
+
+    rows, _, hidden = inputs.shape
+    intermediate = gate_bank.shape[-1]
+    gate_out = up_out = None
+    for start in range(0, hidden, block_size):
+        width = min(block_size, hidden - start)
+        x_slice = inputs[:, :, start : start + width]
+        # Keep the measured gate-BMM-add, then up-BMM-add order so the two
+        # large selected panels need not be live together. Add in start order.
+        gate_panel = gate_bank[:, start : start + width, :][expert_indices].reshape(
+            rows, width, intermediate
+        )
+        with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
+            gate_part = torch.bmm(x_slice, gate_panel)
+        gate_out = gate_part if gate_out is None else gate_out + gate_part
+        up_panel = up_bank[:, start : start + width, :][expert_indices].reshape(
+            rows, width, intermediate
+        )
+        with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
+            up_part = torch.bmm(x_slice, up_panel)
+        up_out = up_part if up_out is None else up_out + up_part
+    return gate_out, up_out
 
 
 def _name_prefill_inputs(x, gate, up, down):
@@ -108,6 +138,13 @@ def _compiled_moe_loop_region(
         raise ValueError(
             "The decode route schedule requires one token and eight routes"
         )
+    if _DECODE_GATE_UP_K_PANEL is not None and (
+        not _DECODE_ROUTE_SCHEDULE
+        or _DECODE_GATE_UP_K_PANEL != 704
+        or H != 2816
+        or gate_dev.shape[-1] != 704
+    ):
+        raise ValueError("Gate/up blocks require the Gemma4 R8 decode shape and width 704")
     probs = _router_probs(
         x_router,
         router_proj_w,
@@ -131,17 +168,22 @@ def _compiled_moe_loop_region(
         inputs = (
             x_expert[:, None, :].expand(T, top_k, H).contiguous().reshape(rows, 1, H)
         )
-        gate = gate_dev[expert_indices].reshape(rows, H, intermediate)
-        up = up_dev[expert_indices].reshape(rows, H, intermediate)
-        down = down_dev[expert_indices].reshape(rows, intermediate, H)
-
-        if _DECODE_ROUTE_SCHEDULE:
-            with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
+        if _DECODE_GATE_UP_K_PANEL is not None:
+            down = down_dev[expert_indices].reshape(rows, intermediate, H)
+            gate_out, up_out = _decode_gate_up_blocks(
+                inputs, gate_dev, up_dev, expert_indices, _DECODE_GATE_UP_K_PANEL
+            )
+        else:
+            gate = gate_dev[expert_indices].reshape(rows, H, intermediate)
+            up = up_dev[expert_indices].reshape(rows, H, intermediate)
+            down = down_dev[expert_indices].reshape(rows, intermediate, H)
+            if _DECODE_ROUTE_SCHEDULE:
+                with spyre_hint(named_dims=["R", "ONE", "F"], work_div={"R": 8}):
+                    gate_out = torch.bmm(inputs, gate)
+                    up_out = torch.bmm(inputs, up)
+            else:
                 gate_out = torch.bmm(inputs, gate)
                 up_out = torch.bmm(inputs, up)
-        else:
-            gate_out = torch.bmm(inputs, gate)
-            up_out = torch.bmm(inputs, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
         expert_out = torch.bmm(activated, down).reshape(T, top_k, H)
 
