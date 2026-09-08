@@ -62,6 +62,7 @@ def _prefill_expert_config():
         or config.co_optimizing_lx_planning
         or config.ktir_emitter
         or config.ignore_work_division_hints
+        or config.ignore_wsr_hints
         or not config.lx_planning
     ):
         raise RuntimeError(
@@ -74,6 +75,41 @@ def _prefill_expert_config():
         read_copy_elision=True,
     )
     return options
+
+
+def _validate_prefill_expert_inputs(x, gate, up, down, routing_weight=None):
+    """Reject an unsupported explicit schedule before any cache writes.
+
+    Forward sees [batch, tokens, hidden]; the expert region sees its flattened
+    [rows, hidden] form. Check both without copying or reshaping device data.
+    Routing is produced later, so its shape is checked again inside the region.
+    """
+    if not _PREFILL_EXPERT_DIVISIONS:
+        return
+    shape = tuple(x.shape)
+    input_ok = shape == (512, 2816) or (
+        routing_weight is None
+        and len(shape) == 3
+        and shape[0] * shape[1] == 512
+        and shape[2] == 2816
+    )
+    if (
+        not input_ok
+        or tuple(gate.shape) != (128, 2816, 704)
+        or tuple(up.shape) != tuple(gate.shape)
+        or tuple(down.shape) != (128, 704, 2816)
+        or any(t.dtype != torch.float16 for t in (x, gate, up, down))
+        or (
+            routing_weight is not None
+            and (
+                tuple(routing_weight.shape) != (512, 128, 1)
+                or routing_weight.dtype != torch.float16
+            )
+        )
+    ):
+        raise ValueError(
+            "Prefill divisions are validated only for FP16 E128/T512/H2816/F704"
+        )
 
 
 def _name_prefill_inputs(x, gate, up, down):
@@ -209,19 +245,7 @@ def _moe_expert_persistent(x_expert, routing_weight, gate, up, down):
 
     experts, hidden, intermediate = gate.shape
 
-    if _PREFILL_EXPERT_DIVISIONS and (
-        tuple(x_expert.shape) != (512, 2816)
-        or tuple(gate.shape) != (128, 2816, 704)
-        or tuple(up.shape) != tuple(gate.shape)
-        or tuple(down.shape) != (128, 704, 2816)
-        or tuple(routing_weight.shape) != (512, 128, 1)
-        or any(
-            t.dtype != torch.float16 for t in (x_expert, routing_weight, gate, up, down)
-        )
-    ):
-        raise ValueError(
-            "Prefill divisions are validated only for FP16 E128/T512/H2816/F704"
-        )
+    _validate_prefill_expert_inputs(x_expert, gate, up, down, routing_weight)
 
     x = x_expert.unsqueeze(0)
     with spyre_hint(named_dims=["E", "T", "ONE"]):
@@ -452,6 +476,10 @@ class Gemma4MoEBlock(nn.Module):
             _prefill_expert_config() if hidden_states.shape[1] > 1 else None
         )
         if hidden_states.shape[1] > 1:
+            experts = self.experts
+            _validate_prefill_expert_inputs(
+                hidden_states, experts.gate_proj, experts.up_proj, experts.down_proj
+            )
             hidden_states, key_cache, value_cache = self._compiled_prefill_attn(
                 hidden_states,
                 selected_freqs,
@@ -460,14 +488,13 @@ class Gemma4MoEBlock(nn.Module):
                 value_cache,
                 cache_index,
             )
-            experts = self.experts
-            _name_prefill_inputs(
-                hidden_states,
-                experts.gate_proj,
-                experts.up_proj,
-                experts.down_proj,
-            )
             try:
+                _name_prefill_inputs(
+                    hidden_states,
+                    experts.gate_proj,
+                    experts.up_proj,
+                    experts.down_proj,
+                )
                 with optional_spyre_config_patch(prefill_options):
                     hidden_states = self._compiled_prefill_ffn(
                         hidden_states, layer_scalar
