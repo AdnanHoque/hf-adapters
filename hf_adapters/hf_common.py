@@ -1957,9 +1957,14 @@ def _generation_forward_options(run_forward_fn, last_hidden_row_only=None):
         if last_hidden_row_only is None:
             return {}
         raise ValueError("The forward driver must declare _last_hidden_row_only")
-    parameter = inspect.signature(run_forward_fn).parameters.get(
-        "_last_hidden_row_only"
-    )
+    try:
+        parameter = inspect.signature(run_forward_fn).parameters.get(
+            "_last_hidden_row_only"
+        )
+    except (TypeError, ValueError):
+        # Some valid callable drivers expose no Python signature. Automatic
+        # selection must leave their existing calling convention unchanged.
+        parameter = None
     if parameter is None or parameter.kind not in (
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
