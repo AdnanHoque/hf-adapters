@@ -1834,6 +1834,18 @@ def decode_block_walk(result, num_generated, padded_len, eos_ids, tokenizer):
     return results
 
 
+def _prefill_next_logits(logits, *, last_row_only=False):
+    """Copy the row generation consumes, without changing model forward.
+
+    On Spyre, transferring an offset view can convert its entire underlying
+    allocation. Materialize the selected row on device before the CPU copy.
+    The opt-in changes movement only; vocabulary cropping remains downstream.
+    """
+    if last_row_only:
+        return logits[:, -1:, :].clone().to("cpu")[:, 0, :]
+    return logits.to("cpu")[:, -1, :]
+
+
 def generate(
     run_forward_fn: Callable,
     model,
@@ -1850,6 +1862,7 @@ def generate(
     top_p=None,
     eos_token_id=_UNSET,
     timing=False,
+    _prefill_last_row_only=False,
     **kwargs,
 ):
     """Model-agnostic generation from tokenized inputs with single-token decode.
@@ -2010,8 +2023,9 @@ def generate(
                 value_caches,
                 cache_index=make_cache_index(0, padded_len, DEVICE),
             )
-            logits_cpu = logits.to("cpu")
-            next_logits = logits_cpu[:, -1, :]
+            next_logits = _prefill_next_logits(
+                logits, last_row_only=_prefill_last_row_only
+            )
             current_cache_len = padded_len
 
         else:
