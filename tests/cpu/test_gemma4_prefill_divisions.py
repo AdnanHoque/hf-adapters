@@ -220,6 +220,16 @@ def test_explicit_unsupported_request_declines(overrides):
         load(True)["_moe_expert_persistent"](*args(**overrides))
 
 
+@pytest.mark.parametrize("input_index", [1, 2, 3, 4])
+def test_mixed_16_bit_inputs_decline(input_index):
+    inputs = args(dtype=torch.bfloat16)
+    inputs[input_index] = inputs[input_index].to(torch.float16)
+    x, route, gate, up, down = inputs
+    assert not load()["_validate_prefill_expert_inputs"](x, gate, up, down, route)
+    with pytest.raises(ValueError, match="FP16/BF16 E128"):
+        load(True)["_validate_prefill_expert_inputs"](x, gate, up, down, route)
+
+
 def compiler_config():
     return SimpleNamespace(
         consumer_compatible_input_staging=False,
