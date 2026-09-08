@@ -19,6 +19,8 @@ evaluating every expert; single-token decode gathers only the selected experts.
 Both paths share one device-resident expert-weight set.
 """
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,6 +38,42 @@ from hf_adapters.hf_gemma4 import (
 __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
+
+# Private, default-off until the extracted compiler/adapter combination has
+# full-model acceptance. Requires the LX stack plus reader-compatible staging
+# and direct-weight-copy proofs; this is not a standalone schedule speedup.
+_PREFILL_EXPERT_DIVISIONS = False
+
+
+def _prefill_expert_config():
+    """Require the measured compiler capabilities, scoped by the caller."""
+    options = {"allow_all_ops_in_lx_planning": True}
+    if not _PREFILL_EXPERT_DIVISIONS:
+        return options
+    from torch_spyre._inductor import config
+
+    if not hasattr(config, "consumer_compatible_input_staging"):
+        raise RuntimeError("Prefill divisions require reader-compatible input staging")
+    if not hasattr(config, "read_copy_elision"):
+        raise RuntimeError("Prefill divisions require direct weight-copy proofs")
+    if (
+        config.sencores != 32
+        or config.layout_solver != "greedy"
+        or config.co_optimizing_lx_planning
+        or config.ktir_emitter
+        or config.ignore_work_division_hints
+        or not config.lx_planning
+    ):
+        raise RuntimeError(
+            "Prefill divisions require 32 cores, greedy LX planning, "
+            "honored hints and the SDSC path"
+        )
+    options.update(
+        lx_planner_relayout=True,
+        consumer_compatible_input_staging=True,
+        read_copy_elision=True,
+    )
+    return options
 
 
 def _name_prefill_inputs(x, gate, up, down):
@@ -171,15 +209,39 @@ def _moe_expert_persistent(x_expert, routing_weight, gate, up, down):
 
     experts, hidden, intermediate = gate.shape
 
+    if _PREFILL_EXPERT_DIVISIONS and (
+        tuple(x_expert.shape) != (512, 2816)
+        or tuple(gate.shape) != (128, 2816, 704)
+        or tuple(up.shape) != tuple(gate.shape)
+        or tuple(down.shape) != (128, 704, 2816)
+        or tuple(routing_weight.shape) != (512, 128, 1)
+        or any(
+            t.dtype != torch.float16 for t in (x_expert, routing_weight, gate, up, down)
+        )
+    ):
+        raise ValueError(
+            "Prefill divisions are validated only for FP16 E128/T512/H2816/F704"
+        )
+
     x = x_expert.unsqueeze(0)
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = routing_weight.permute(1, 0, 2).contiguous().clone()
 
     with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": 32}):
-        gate_out = torch.matmul(x, gate)
-        up_out = torch.matmul(x, up)
+        with (
+            spyre_hint(work_div={"T": 8, "H": 4})
+            if _PREFILL_EXPERT_DIVISIONS
+            else nullcontext()
+        ):
+            gate_out = torch.matmul(x, gate)
+            up_out = torch.matmul(x, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
-        down_out = torch.matmul(activated, down)
+        with (
+            spyre_hint(work_div={"T": 16, "H": 2})
+            if _PREFILL_EXPERT_DIVISIONS
+            else nullcontext()
+        ):
+            down_out = torch.matmul(activated, down)
         return (down_out * route).sum(dim=0)
 
 
@@ -385,6 +447,10 @@ class Gemma4MoEBlock(nn.Module):
         cache_index,
         layer_scalar,
     ):
+        # Check explicit opt-in requirements before attention/cache mutation.
+        prefill_options = (
+            _prefill_expert_config() if hidden_states.shape[1] > 1 else None
+        )
         if hidden_states.shape[1] > 1:
             hidden_states, key_cache, value_cache = self._compiled_prefill_attn(
                 hidden_states,
@@ -401,9 +467,13 @@ class Gemma4MoEBlock(nn.Module):
                 experts.up_proj,
                 experts.down_proj,
             )
-            with optional_spyre_config_patch({"allow_all_ops_in_lx_planning": True}):
-                hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
-            _reset_named_dims()
+            try:
+                with optional_spyre_config_patch(prefill_options):
+                    hidden_states = self._compiled_prefill_ffn(
+                        hidden_states, layer_scalar
+                    )
+            finally:
+                _reset_named_dims()
         else:
             hidden_states, key_cache, value_cache = self._compiled_decode(
                 hidden_states,
