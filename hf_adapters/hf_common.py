@@ -21,6 +21,7 @@ Per-model adapters import from this module and provide only model-specific
 compiled block functions.
 """
 
+import inspect
 import math
 import os
 import sys
@@ -1944,6 +1945,32 @@ def _prefill_next_logits(logits, *, last_row_only=True):
     return logits.to("cpu")[:, -1, :]
 
 
+def _generation_forward_options(run_forward_fn, last_hidden_row_only=None):
+    """Use the bounded head automatically when the driver supports it.
+
+    None selects automatically, False is a comparison opt-out, and an explicit
+    True still rejects an unsupported driver before generation touches caches.
+    """
+    if last_hidden_row_only is False:
+        return {}
+    if run_forward_fn is None:
+        if last_hidden_row_only is None:
+            return {}
+        raise ValueError("The forward driver must declare _last_hidden_row_only")
+    parameter = inspect.signature(run_forward_fn).parameters.get(
+        "_last_hidden_row_only"
+    )
+    if parameter is None or parameter.kind not in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        # A **kwargs-only driver could silently ignore this request.
+        if last_hidden_row_only is None:
+            return {}
+        raise ValueError("The forward driver must declare _last_hidden_row_only")
+    return {"_last_hidden_row_only": True}
+
+
 def generate(
     run_forward_fn: Optional[Callable],
     model,
@@ -1961,6 +1988,7 @@ def generate(
     eos_token_id=_UNSET,
     timing=False,
     _prefill_last_row_only=True,
+    _generation_last_hidden_row_only=None,
     prefill_fn: Optional[Callable] = None,
     decode_fn: Optional[Callable] = None,
     token_aligned_inputs: Optional[dict[str, tuple[torch.Tensor, Any]]] = None,
@@ -2020,6 +2048,12 @@ def generate(
             each prefill chunk. Falls back to the adapter's configured chunk
             size, or one-shot prefill when the adapter has no override.
     """
+    # Prefill branches are mutually exclusive: a custom callback replaces the
+    # text driver. Inspect the one that will actually receive the keyword.
+    prefill_driver = prefill_fn if prefill_fn is not None else run_forward_fn
+    forward_row_kwargs = _generation_forward_options(
+        prefill_driver, _generation_last_hidden_row_only
+    )
     overrides = {
         "max_new_tokens": max_new_tokens,
         "max_length": max_length,
@@ -2177,6 +2211,7 @@ def generate(
                     value_caches=prefill_value_caches,
                     cache_index=make_cache_index(0, padded_len, DEVICE),
                     **normalized_token_inputs,
+                    **forward_row_kwargs,
                 )
             else:
                 # Keep Lk fixed at the complete prefill extent while advancing
@@ -2202,6 +2237,7 @@ def generate(
                         cache_index=make_cache_index(
                             chunk_start, query_chunk_size, DEVICE
                         ),
+                        **forward_row_kwargs,
                     )
             # Only the last chunk's logits matter for next-token selection.
             next_logits = _prefill_next_logits(
