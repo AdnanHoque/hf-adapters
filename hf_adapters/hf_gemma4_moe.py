@@ -99,7 +99,10 @@ def _decode_gate_up_panel(hidden, intermediate, dtypes, route_schedule):
         route_schedule
         and hidden == 2816
         and intermediate == 704
-        and all(dtype == torch.float16 for dtype in dtypes)
+        # Both host formats use SEN169_FP16 device arithmetic/storage.
+        # Gemma's checkpoint uses bfloat16; float32 is a different device path.
+        and dtypes[0] in (torch.float16, torch.bfloat16)
+        and all(dtype == dtypes[0] for dtype in dtypes)
     ):
         return _DECODE_GATE_UP_K_PANEL
     return None

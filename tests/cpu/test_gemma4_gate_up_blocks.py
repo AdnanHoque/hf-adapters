@@ -84,7 +84,7 @@ class GateUpBlockTests(unittest.TestCase):
         # Meta tensors exercise shipped dispatch and all BMM shapes without
         # allocating the full bank. Numerical device acceptance is separate.
         def make(*shape):
-            return torch.empty(shape, device="meta", dtype=torch.float16)
+            return torch.empty(shape, device="meta", dtype=torch.bfloat16)
 
         ids = torch.empty((1, 8), device="meta", dtype=torch.int64)
         weights = make(1, 8)
@@ -129,7 +129,11 @@ class GateUpBlockTests(unittest.TestCase):
         self.assertIsNone(choose(2816, 704, fp16, False))
         self.assertIsNone(choose(1408, 704, fp16, True))
         self.assertIsNone(choose(2816, 768, fp16, True))
-        self.assertIsNone(choose(2816, 704, (torch.bfloat16,) * 4, True))
+        self.assertEqual(
+            choose(2816, 704, (torch.bfloat16,) * 4, True),
+            choose(2816, 704, fp16, True),
+        )
+        self.assertIsNone(choose(2816, 704, (torch.float32,) * 4, True))
         self.assertIsNone(choose(2816, 704, (*fp16[:3], torch.float32), True))
         off = load_functions({"_decode_gate_up_panel"}, _DECODE_GATE_UP_K_PANEL=None)
         self.assertIsNone(off["_decode_gate_up_panel"](2816, 704, fp16, True))
