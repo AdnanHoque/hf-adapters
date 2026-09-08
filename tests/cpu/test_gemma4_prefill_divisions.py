@@ -175,7 +175,7 @@ def test_default_incompatible_config_uses_ordinary_path(name, value):
         {"tokens": 256},
         {"hidden": 1408},
         {"width": 768},
-        {"dtype": torch.bfloat16},
+        {"dtype": torch.float32},
     ],
 )
 def test_default_unsupported_shape_keeps_ordinary_arithmetic(overrides):
@@ -186,7 +186,8 @@ def test_default_unsupported_shape_keeps_ordinary_arithmetic(overrides):
     assert multiply.call_count == 3
 
 
-def test_automatic_default_requests_each_measured_matmul_division():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_automatic_default_requests_each_measured_matmul_division(dtype):
     observed = []
     original = torch.matmul
     with with_config(compiler_config()), hints() as active:
@@ -199,7 +200,7 @@ def test_automatic_default_requests_each_measured_matmul_division():
             return original(a, b)
 
         with patch.object(torch, "matmul", multiply):
-            result = load()["_moe_expert_persistent"](*args())
+            result = load()["_moe_expert_persistent"](*args(dtype=dtype))
     assert tuple(result.shape) == (512, 2816)
     assert observed == [{"T": 8, "H": 4}, {"T": 8, "H": 4}, {"T": 16, "H": 2}]
 
@@ -211,11 +212,11 @@ def test_automatic_default_requests_each_measured_matmul_division():
         {"tokens": 256},
         {"hidden": 1408},
         {"width": 768},
-        {"dtype": torch.bfloat16},
+        {"dtype": torch.float32},
     ],
 )
 def test_explicit_unsupported_request_declines(overrides):
-    with hints(), pytest.raises(ValueError, match="FP16 E128"):
+    with hints(), pytest.raises(ValueError, match="FP16/BF16 E128"):
         load(True)["_moe_expert_persistent"](*args(**overrides))
 
 
@@ -346,7 +347,7 @@ def forward_with(ns):
         {"hidden": 1408},
         {"width": 768},
         {"experts": 64},
-        {"dtype": torch.bfloat16},
+        {"dtype": torch.float32},
     ],
 )
 def test_shape_errors_precede_attention_and_cache_writes(overrides):
@@ -364,7 +365,10 @@ def test_shape_errors_precede_attention_and_cache_writes(overrides):
         experts=SimpleNamespace(gate_proj=gate, up_proj=up, down_proj=down),
         _compiled_prefill_attn=attention,
     )
-    with with_config(compiler_config()), pytest.raises(ValueError, match="FP16 E128"):
+    with (
+        with_config(compiler_config()),
+        pytest.raises(ValueError, match="FP16/BF16 E128"),
+    ):
         forward_with(load(True))(
             instance, x.unsqueeze(0), None, None, key, value, None, None
         )
@@ -424,14 +428,14 @@ def test_partial_dimension_naming_is_cleaned_up():
 def test_region_retains_routing_guard(bad_route):
     inputs = args()
     inputs[1] = bad_route
-    with hints(), pytest.raises(ValueError, match="FP16 E128"):
+    with hints(), pytest.raises(ValueError, match="FP16/BF16 E128"):
         load(True)["_moe_expert_persistent"](*inputs)
 
 
 def test_region_requires_flat_rows_even_though_forward_accepts_batched_input():
     inputs = args()
     inputs[0] = inputs[0].unsqueeze(0)
-    with hints(), pytest.raises(ValueError, match="FP16 E128"):
+    with hints(), pytest.raises(ValueError, match="FP16/BF16 E128"):
         load(True)["_moe_expert_persistent"](*inputs)
 
 

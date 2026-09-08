@@ -111,18 +111,21 @@ def _validate_prefill_expert_inputs(x, gate, up, down, routing_weight=None):
         or tuple(gate.shape) != (128, 2816, 704)
         or tuple(up.shape) != tuple(gate.shape)
         or tuple(down.shape) != (128, 704, 2816)
-        or any(t.dtype != torch.float16 for t in (x, gate, up, down))
+        # Both host 16-bit formats map to SEN169_FP16 on Spyre. The production
+        # checkpoint uses bfloat16, unlike the isolated float16 microbenchmark.
+        or x.dtype not in (torch.float16, torch.bfloat16)
+        or any(t.dtype != x.dtype for t in (gate, up, down))
         or (
             routing_weight is not None
             and (
                 tuple(routing_weight.shape) != (512, 128, 1)
-                or routing_weight.dtype != torch.float16
+                or routing_weight.dtype != x.dtype
             )
         )
     ):
         if _PREFILL_EXPERT_DIVISIONS is True:
             raise ValueError(
-                "Prefill divisions are validated only for FP16 E128/T512/H2816/F704"
+                "Prefill divisions require matching FP16/BF16 E128/T512/H2816/F704"
             )
         return False
     return True
