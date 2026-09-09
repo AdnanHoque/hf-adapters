@@ -101,6 +101,7 @@ from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 import hf_adapters.hf_common as hf_common
 from hf_adapters import (
     hf_bert,
+    hf_bharatgen,
     hf_clip,
     hf_distilbert,
     hf_dspark_gemma4,
@@ -192,6 +193,7 @@ ARCH_TO_ADAPTER_MODULE_MAPPING: dict[str, ModuleType] = {
     "Qwen3DSparkModel": hf_dspark_qwen3,
     "Gemma4DSparkModel": hf_dspark_gemma4,
     "GraniteDSparkModel": hf_dspark_granite,
+    "ParamBharatGenForCausalLM": hf_bharatgen,
 }
 
 # Multimodal (image-text-to-text) mapping — used by
@@ -362,9 +364,12 @@ class AutoSpyreModel:
         model_name_or_path: Union[str, os.PathLike[str]],
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
+        trust_remote_code: bool | None = None,
     ) -> PreTrainedModel:
         module: ModuleType = resolve_adapter_module(
-            model_name_or_path=model_name_or_path, mapping=cls._module_mapping
+            model_name_or_path=model_name_or_path,
+            mapping=cls._module_mapping,
+            trust_remote_code=trust_remote_code,
         )
         if dtype is None:
             dtype = dtype_for_model_path(
@@ -378,6 +383,7 @@ class AutoSpyreModel:
             dtype,
             auto_model_cls=cls._auto_model_cls,
             tp_plan=tp_plan,
+            trust_remote_code=trust_remote_code,
         )
         move_model_to_spyre(model, module, dtype)
         return model
@@ -398,15 +404,21 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
         model_name_or_path: Union[str, os.PathLike[str]],
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
+        trust_remote_code: bool | None = None,
     ) -> PreTrainedModel:
-        module: ModuleType = resolve_adapter_module(model_name_or_path)
+        module: ModuleType = resolve_adapter_module(
+            model_name_or_path, trust_remote_code=trust_remote_code
+        )
         if getattr(module, "_is_encoder_only", False):
             raise SpyreUnsupportedModelError(
                 "Generation is not currently supported for encoder-only architectures"
             )
 
         model: PreTrainedModel = super().from_pretrained(
-            model_name_or_path, dtype=dtype, tp_plan=tp_plan
+            model_name_or_path,
+            dtype=dtype,
+            tp_plan=tp_plan,
+            trust_remote_code=trust_remote_code,
         )
 
         def model_generate(
@@ -485,12 +497,18 @@ class AutoSpyreModelForMaskedLM(AutoSpyreModel):
         model_name_or_path: Union[str, os.PathLike[str]],
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
+        trust_remote_code: bool | None = None,
     ) -> PreTrainedModel:
         module: ModuleType = resolve_adapter_module(
-            model_name_or_path, mapping=cls._module_mapping
+            model_name_or_path,
+            mapping=cls._module_mapping,
+            trust_remote_code=trust_remote_code,
         )
         model: PreTrainedModel = super().from_pretrained(
-            model_name_or_path, dtype=dtype, tp_plan=tp_plan
+            model_name_or_path,
+            dtype=dtype,
+            tp_plan=tp_plan,
+            trust_remote_code=trust_remote_code,
         )
 
         def model_forward(
@@ -559,10 +577,16 @@ class AutoSpyreModelForQuestionAnswering(AutoSpyreModel):
         model_name_or_path: Union[str, os.PathLike[str]],
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
+        trust_remote_code: bool | None = None,
     ) -> PreTrainedModel:
-        module: ModuleType = resolve_adapter_module(model_name_or_path)
+        module: ModuleType = resolve_adapter_module(
+            model_name_or_path, trust_remote_code=trust_remote_code
+        )
         model: PreTrainedModel = super().from_pretrained(
-            model_name_or_path, dtype=dtype, tp_plan=tp_plan
+            model_name_or_path,
+            dtype=dtype,
+            tp_plan=tp_plan,
+            trust_remote_code=trust_remote_code,
         )
         if model.config.num_labels != 2:
             raise SpyreUnsupportedModelError(
@@ -642,12 +666,18 @@ class AutoSpyreModelForSequenceClassification(AutoSpyreModel):
         model_name_or_path: Union[str, os.PathLike[str]],
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
+        trust_remote_code: bool | None = None,
     ) -> PreTrainedModel:
         module: ModuleType = resolve_adapter_module(
-            model_name_or_path, mapping=cls._module_mapping
+            model_name_or_path,
+            mapping=cls._module_mapping,
+            trust_remote_code=trust_remote_code,
         )
         model: PreTrainedModel = super().from_pretrained(
-            model_name_or_path, dtype=dtype, tp_plan=tp_plan
+            model_name_or_path,
+            dtype=dtype,
+            tp_plan=tp_plan,
+            trust_remote_code=trust_remote_code,
         )
 
         def model_forward(
@@ -734,12 +764,18 @@ class AutoSpyreModelForTokenClassification(AutoSpyreModel):
         model_name_or_path: Union[str, os.PathLike[str]],
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
+        trust_remote_code: bool | None = None,
     ) -> PreTrainedModel:
         module: ModuleType = resolve_adapter_module(
-            model_name_or_path, mapping=cls._module_mapping
+            model_name_or_path,
+            mapping=cls._module_mapping,
+            trust_remote_code=trust_remote_code,
         )
         model: PreTrainedModel = super().from_pretrained(
-            model_name_or_path, dtype=dtype, tp_plan=tp_plan
+            model_name_or_path,
+            dtype=dtype,
+            tp_plan=tp_plan,
+            trust_remote_code=trust_remote_code,
         )
 
         def model_forward(
@@ -879,13 +915,18 @@ class AutoSpyreModelForImageTextToText(AutoSpyreModel):
         model_name_or_path: Union[str, os.PathLike[str]],
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
+        trust_remote_code: bool | None = None,
     ):
         module: ModuleType = resolve_adapter_module(
             model_name_or_path,
             mapping=cls._module_mapping,
+            trust_remote_code=trust_remote_code,
         )
         model: PreTrainedModel = super().from_pretrained(
-            model_name_or_path, dtype=dtype, tp_plan=tp_plan
+            model_name_or_path,
+            dtype=dtype,
+            tp_plan=tp_plan,
+            trust_remote_code=trust_remote_code,
         )
 
         def model_generate(

@@ -1571,6 +1571,7 @@ def load_model_common(
     dtype=torch.float16,
     auto_model_cls=None,
     tp_plan=None,
+    trust_remote_code=None,
 ):
     """Load an HF model.
 
@@ -1585,6 +1586,9 @@ def load_model_common(
             ``device_map`` is omitted so HF's TP placement is authoritative.
             ``"auto"`` is resolved to a plan that keeps ``lm_head`` replicated
             (see ``_resolve_tp_plan``).
+        trust_remote_code: Passed through to the adapter's ``load_hf_model`` (or
+            to HF's ``from_pretrained``) so checkpoints shipping custom modeling
+            code load only when the caller explicitly opts in.
     """
     if auto_model_cls is None:
         from transformers import AutoModel
@@ -1597,7 +1601,9 @@ def load_model_common(
         )
 
     if hasattr(module, "load_hf_model"):
-        model = module.load_hf_model(model_path, dtype)
+        model = module.load_hf_model(
+            model_path, dtype, trust_remote_code=trust_remote_code
+        )
     elif tp_plan is not None:
         from transformers.distributed import DistributedConfig
 
@@ -1609,12 +1615,14 @@ def load_model_common(
             model_path,
             dtype=dtype,
             distributed_config=distributed_config,
+            trust_remote_code=trust_remote_code,
         )
     else:
         model = auto_model_cls.from_pretrained(
             model_path,
             dtype=dtype,
             device_map="cpu",
+            trust_remote_code=trust_remote_code,
         )
 
     model.eval()

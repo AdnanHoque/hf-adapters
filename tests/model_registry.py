@@ -166,6 +166,14 @@ CAUSAL_LM_MODELS = {
         "adapter": "hf_llama.py",
         "size": "6b",
     },
+    # hf_bharatgen.py
+    "param_1_5b": {
+        "name": "BharatGen Param-1 5B",
+        "path": "bharatgenai/Param-1-5B",
+        "adapter": "hf_bharatgen.py",
+        "size": "5b",
+        "trust_remote_code": True,
+    },
     # hf_phi3.py
     "phi4": {
         "name": "Phi-4 mini",

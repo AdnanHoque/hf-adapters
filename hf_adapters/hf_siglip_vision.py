@@ -190,7 +190,7 @@ def prepare_for_spyre(model):
     ]
 
 
-def load_hf_model(model_path, dtype=torch.float16):
+def load_hf_model(model_path, dtype=torch.float16, trust_remote_code=None):
     """Load the bare ``SiglipVisionModel`` reference (stock HF, for tests).
 
     Pulls just the vision tower out of the multimodal checkpoint by remapping

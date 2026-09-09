@@ -199,15 +199,24 @@ def _prepare_clip_encoder(encoder_module, config):
     encoder_module.forward = types.MethodType(_spyre_encoder_forward, encoder_module)
 
 
-def load_hf_model(model_path, dtype=torch.float16):
+def load_hf_model(model_path, dtype=torch.float16, trust_remote_code=None):
     """Load CLIPModel from model_path or its subfolder (e.g. 0_CLIPModel)."""
     from transformers import CLIPModel
 
     try:
-        model = CLIPModel.from_pretrained(model_path, dtype=dtype, device_map="cpu")
+        model = CLIPModel.from_pretrained(
+            model_path,
+            dtype=dtype,
+            device_map="cpu",
+            trust_remote_code=trust_remote_code,
+        )
     except Exception:
         model = CLIPModel.from_pretrained(
-            model_path, subfolder="0_CLIPModel", dtype=dtype, device_map="cpu"
+            model_path,
+            subfolder="0_CLIPModel",
+            dtype=dtype,
+            device_map="cpu",
+            trust_remote_code=trust_remote_code,
         )
     return model
 
