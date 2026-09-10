@@ -41,13 +41,13 @@ _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
 # Automatic for supported inputs and compilers. None selects automatically,
 # False is a comparison opt-out, True requires support before cache writes.
-# Requires the LX stack plus reader-compatible staging and direct-weight-copy
-# proofs; this is not a standalone schedule speedup.
+# Requires the LX stack plus reader-compatible staging. The recorded performance
+# also used rewrite-preserved weight-copy proofs; those are not a safety gate.
 _PREFILL_EXPERT_DIVISIONS = None
 
 
 def _prefill_expert_config():
-    """Require the measured compiler capabilities, scoped by the caller."""
+    """Check supported compiler controls, scoped by the caller."""
     options = {"allow_all_ops_in_lx_planning": True}
     if _PREFILL_EXPERT_DIVISIONS is False:
         return options
@@ -59,9 +59,11 @@ def _prefill_expert_config():
                 "Prefill divisions require reader-compatible input staging"
             )
         return options
+    # This checks the control, not which rewrites preserve elision candidates.
+    # Missing preservation keeps the copy; it loses performance, not safety.
     if not hasattr(config, "read_copy_elision"):
         if _PREFILL_EXPERT_DIVISIONS is True:
-            raise RuntimeError("Prefill divisions require direct weight-copy proofs")
+            raise RuntimeError("Read-copy elision is not available")
         return options
     if not hasattr(config, "lx_planner_relayout"):
         if _PREFILL_EXPERT_DIVISIONS is True:
