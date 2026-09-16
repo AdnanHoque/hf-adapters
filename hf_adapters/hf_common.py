@@ -1965,6 +1965,28 @@ def _prefill_next_logits(logits, *, last_row_only=True):
     return logits.to("cpu")[:, -1, :]
 
 
+def supports_last_hidden_row(run_forward_fn: Optional[Callable]) -> bool:
+    """Whether the driver explicitly accepts the last-hidden-row keyword.
+
+    A driver with only **kwargs could silently ignore the request. None and
+    callables without an inspectable signature keep their existing behavior.
+    A wrapper that hides the parameter also keeps the existing path.
+    Generation and its tests use this same check.
+    """
+    if run_forward_fn is None:
+        return False
+    try:
+        parameter = inspect.signature(run_forward_fn).parameters.get(
+            "_last_hidden_row_only"
+        )
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
 def _generation_forward_options(run_forward_fn, last_hidden_row_only=None):
     """Use the bounded head automatically when the driver supports it.
 
@@ -1973,23 +1995,7 @@ def _generation_forward_options(run_forward_fn, last_hidden_row_only=None):
     """
     if last_hidden_row_only is False:
         return {}
-    if run_forward_fn is None:
-        if last_hidden_row_only is None:
-            return {}
-        raise ValueError("The forward driver must declare _last_hidden_row_only")
-    try:
-        parameter = inspect.signature(run_forward_fn).parameters.get(
-            "_last_hidden_row_only"
-        )
-    except (TypeError, ValueError):
-        # Some valid callable drivers expose no Python signature. Automatic
-        # selection must leave their existing calling convention unchanged.
-        parameter = None
-    if parameter is None or parameter.kind not in (
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
-    ):
-        # A **kwargs-only driver could silently ignore this request.
+    if not supports_last_hidden_row(run_forward_fn):
         if last_hidden_row_only is None:
             return {}
         raise ValueError("The forward driver must declare _last_hidden_row_only")

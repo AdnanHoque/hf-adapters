@@ -34,9 +34,11 @@ from hf_adapters.auto_spyre_model import dtype_for_model_path
 from hf_adapters.hf_common import (
     DEVICE,
     encode_prompts,
+    generate,
     generation_cache_len,
     get_model_dtype,
     move_model_to_spyre,
+    supports_last_hidden_row,
 )
 from tests.conftest import load_ref_model, resolve_adapter_module_for_test
 from tests.model_registry import (
@@ -323,11 +325,9 @@ def _run_model_test(
     )
 
     rows = _compare_results(hf_results, adapter_results, tokenizer, model_path)
-    if adapter.__name__ in ("hf_adapters.hf_gemma4", "hf_adapters.hf_gemma4_moe"):
+    if supports_last_hidden_row(adapter._run_forward):
         # Forward-only comparison bypasses generation's bounded head and copy.
         # Reuse this model/reference and the real loop, with fresh request caches.
-        from hf_adapters.hf_common import generate
-
         output = generate(
             adapter._run_forward,
             model,

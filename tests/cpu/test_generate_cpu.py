@@ -208,17 +208,36 @@ def test_generation_row_optimizations(monkeypatch, chunk_size, custom_prefill):
 def test_generation_row_option_requires_supported_driver():
     import torch
 
-    from hf_adapters.hf_common import _generation_forward_options
+    from hf_adapters.hf_common import (
+        _generation_forward_options,
+        supports_last_hidden_row,
+    )
 
-    def supported(*args, _last_hidden_row_only=False):
+    def keyword_only(*args, _last_hidden_row_only=False):
         pass
 
-    assert _generation_forward_options(supported) == {"_last_hidden_row_only": True}
-    for driver in (None, lambda **kwargs: None, torch.neg):
+    def positional_or_keyword(_last_hidden_row_only=False):
+        pass
+
+    def positional_only(_last_hidden_row_only=False, /):
+        pass
+
+    def variadic(*_last_hidden_row_only):
+        pass
+
+    for driver in (keyword_only, positional_or_keyword):
+        assert supports_last_hidden_row(driver)
+        for requested in (None, True):
+            assert _generation_forward_options(driver, requested) == {
+                "_last_hidden_row_only": True
+            }
+        assert _generation_forward_options(driver, False) == {}
+    for driver in (None, lambda **kwargs: None, torch.neg, positional_only, variadic):
+        assert not supports_last_hidden_row(driver)
         assert _generation_forward_options(driver) == {}
+        assert _generation_forward_options(driver, False) == {}
         with pytest.raises(ValueError, match="must declare"):
             _generation_forward_options(driver, True)
-    assert _generation_forward_options(supported, False) == {}
 
 
 def test_prefill_logit_copy_has_only_the_selected_row():
