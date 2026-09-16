@@ -267,7 +267,7 @@ def test_gemma_decode_block_composition(
     monkeypatch.setattr(moe, "_router_probs", lambda *args: make(1, 8))
     monkeypatch.setattr(
         moe,
-        "_topk",
+        "moe_topk",
         lambda *args: (make(1, 8), torch.empty(1, 8, device="meta", dtype=torch.int64)),
     )
     selected, products = [], []
@@ -351,15 +351,19 @@ def test_gemma_prefill_schedule_selection(gemma_moe_compiler, monkeypatch, dtype
 
 def test_gemma_block_addresses_and_order(gemma_moe_compiler):
     """Small exact integers isolate movement/order from device rounding."""
-    moe, _ = gemma_moe_compiler
+    from hf_adapters.hf_common import (
+        _moe_decode_down_output_blocks,
+        _moe_decode_gate_up_blocks,
+    )
+
     ids = torch.tensor([[0, 2, 2, 0]])
     x = torch.arange(20).reshape(4, 1, 5).double() % 3
     gate = torch.arange(3 * 5 * 7).reshape(3, 5, 7).double() % 5
     up, down = gate + 1, gate.transpose(1, 2).contiguous()
-    g, u = moe._decode_gate_up_blocks(x, gate, up, ids, 2)
+    g, u = _moe_decode_gate_up_blocks(x, gate, up, ids, 2)
     assert torch.equal(g, torch.bmm(x, gate[ids].reshape(4, 5, 7)))
     assert torch.equal(u, torch.bmm(x, up[ids].reshape(4, 5, 7)))
-    actual = moe._decode_down_output_blocks(g, down, ids, 2)
+    actual = _moe_decode_down_output_blocks(g, down, ids, 2)
     assert torch.equal(actual, torch.bmm(g, down[ids].reshape(4, 7, 5)))
 
 
@@ -419,7 +423,14 @@ def test_gemma_prefill_explicit_loop(gemma_moe_compiler, monkeypatch, use_divisi
         .double()
         .unsqueeze(-1)
     )
-    actual = moe._moe_expert_persistent(x, route, gate, up, down)
+    # Exercise the shared helper's Spyre loop branch with the eager tile
+    # interpreter above. Storage and arithmetic remain CPU-only; this is not
+    # a device-lowering or device-numerics test.
+    with monkeypatch.context() as device_branch:
+        device_branch.setattr(
+            torch.Tensor, "device", property(lambda self: SimpleNamespace(type="spyre"))
+        )
+        actual = moe._moe_expert_persistent(x, route, gate, up, down)
     expected = torch.zeros_like(x)
     for e in range(3):
         activated = torch.nn.functional.gelu(x @ gate[e], approximate="tanh") * (
