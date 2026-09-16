@@ -982,18 +982,8 @@ def _run_forward(
     key_caches,
     value_caches,
     cache_index,
-    *,
-    _last_hidden_row_only=False,
 ):
-    """Gemma 4 forward; generation may request only the final head row.
-
-    The default returns every row. The opt-in leaves the backbone and all
-    cache updates intact, selecting a row before the existing vocabulary head
-    and softcap. Chunked generation requests one head row for each chunk,
-    while every chunk still runs its complete backbone and cache updates.
-    A differently shaped matmul may round differently; this is
-    not a promise of bitwise equality to the full-row device calculation.
-    """
+    """Ordinary forward returns logits for every input row."""
     h = _run_backbone_forward(
         model,
         input_ids,
@@ -1004,8 +994,41 @@ def _run_forward(
         cache_index,
     )
 
-    if _last_hidden_row_only:
+    return _logits_from_hidden(model, h)
+
+
+def _run_prefill_next_logits(
+    model,
+    input_ids,
+    position_ids,
+    attn_mask,
+    key_caches,
+    value_caches,
+    cache_index,
+):
+    """Return final-row logits [B, 1, V] after the full backbone and cache writes.
+
+    This optional generation driver has the same arguments as _run_forward.
+    Generation consumes only the last row of each prefill chunk or decode call.
+    Single-row inputs use the same head input as _run_forward, so decode is
+    unchanged.
+    A smaller head matmul can round differently from the all-row calculation.
+    """
+    h = _run_backbone_forward(
+        model,
+        input_ids,
+        position_ids,
+        attn_mask,
+        key_caches,
+        value_caches,
+        cache_index,
+    )
+    if h.shape[1] > 1:
         h = h[:, -1:, :]
+    return _logits_from_hidden(model, h)
+
+
+def _logits_from_hidden(model, h):
     logits = model.lm_head(h)
 
     cap = text_config(model.config).final_logit_softcapping

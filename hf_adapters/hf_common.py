@@ -21,7 +21,6 @@ Per-model adapters import from this module and provide only model-specific
 compiled block functions.
 """
 
-import inspect
 import math
 import os
 import sys
@@ -2216,54 +2215,14 @@ def select_next_token(
     return (tokens, scores) if return_scores else tokens
 
 
-def _prefill_next_logits(logits, *, last_row_only=True):
+def _prefill_next_logits(logits):
     """Copy the row generation consumes, without changing model forward.
 
     On Spyre, transferring an offset view can convert its entire underlying
     allocation. Materialize the selected row on device before the CPU copy.
-    Only movement changes; vocabulary cropping remains downstream. The optional
-    False override retains the full transfer for controlled comparisons.
+    Vocabulary cropping remains downstream.
     """
-    if last_row_only:
-        return logits[:, -1:, :].clone().to("cpu")[:, 0, :]
-    return logits.to("cpu")[:, -1, :]
-
-
-def supports_last_hidden_row(run_forward_fn: Optional[Callable]) -> bool:
-    """Whether the driver explicitly accepts the last-hidden-row keyword.
-
-    A driver with only **kwargs could silently ignore the request. None and
-    callables without an inspectable signature keep their existing behavior.
-    A wrapper that hides the parameter also keeps the existing path.
-    Generation and its tests use this same check.
-    """
-    if run_forward_fn is None:
-        return False
-    try:
-        parameter = inspect.signature(run_forward_fn).parameters.get(
-            "_last_hidden_row_only"
-        )
-    except (TypeError, ValueError):
-        return False
-    return parameter is not None and parameter.kind in (
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
-    )
-
-
-def _generation_forward_options(run_forward_fn, last_hidden_row_only=None):
-    """Use the bounded head automatically when the driver supports it.
-
-    None selects automatically, False is a comparison opt-out, and an explicit
-    True still rejects an unsupported driver before generation touches caches.
-    """
-    if last_hidden_row_only is False:
-        return {}
-    if not supports_last_hidden_row(run_forward_fn):
-        if last_hidden_row_only is None:
-            return {}
-        raise ValueError("The forward driver must declare _last_hidden_row_only")
-    return {"_last_hidden_row_only": True}
+    return logits[:, -1:, :].clone().to("cpu")[:, 0, :]
 
 
 def generate(
@@ -2282,8 +2241,6 @@ def generate(
     top_p=None,
     eos_token_id=_UNSET,
     timing=False,
-    _prefill_last_row_only=True,
-    _generation_last_hidden_row_only=None,
     prefill_fn: Optional[Callable] = None,
     decode_fn: Optional[Callable] = None,
     token_aligned_inputs: Optional[dict[str, tuple[torch.Tensor, Any]]] = None,
@@ -2292,7 +2249,7 @@ def generate(
     """Model-agnostic generation: optional chunked prefill, then token decode.
 
     When attached to a model via ``auto_spyre_model.py`` (which binds
-    ``run_forward_fn`` to the adapter module's ``_run_forward``), callers use
+    ``run_forward_fn`` to the adapter's generation driver), callers use
     the stock input and tensor-output shape::
 
         encoded = tokenizer(["Hello!"], return_tensors="pt", padding=True)
@@ -2343,12 +2300,6 @@ def generate(
             each prefill chunk. Falls back to the adapter's configured chunk
             size, or one-shot prefill when the adapter has no override.
     """
-    # Prefill branches are mutually exclusive: a custom callback replaces the
-    # text driver. Inspect the one that will actually receive the keyword.
-    prefill_driver = prefill_fn if prefill_fn is not None else run_forward_fn
-    forward_row_kwargs = _generation_forward_options(
-        prefill_driver, _generation_last_hidden_row_only
-    )
     overrides = {
         "max_new_tokens": max_new_tokens,
         "max_length": max_length,
@@ -2506,7 +2457,6 @@ def generate(
                     value_caches=prefill_value_caches,
                     cache_index=make_cache_index(0, padded_len, DEVICE),
                     **normalized_token_inputs,
-                    **forward_row_kwargs,
                 )
             else:
                 # Keep Lk fixed at the complete prefill extent while advancing
@@ -2532,12 +2482,9 @@ def generate(
                         cache_index=make_cache_index(
                             chunk_start, query_chunk_size, DEVICE
                         ),
-                        **forward_row_kwargs,
                     )
             # Only the last chunk's logits matter for next-token selection.
-            next_logits = _prefill_next_logits(
-                logits, last_row_only=_prefill_last_row_only
-            )
+            next_logits = _prefill_next_logits(logits)
             current_cache_len = padded_len
 
         else:

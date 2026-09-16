@@ -86,7 +86,7 @@ def test_multibatch(model_path: str, trust_remote_code: bool | None) -> None:
     )
     _set_rope_dtype(model, dtype)
     sequences = hf_common_mod.generate(
-        adapter_mod._run_forward,
+        getattr(adapter_mod, "_run_prefill_next_logits", adapter_mod._run_forward),
         model,
         **encoded,
         max_new_tokens=MAX_NEW_TOKENS,
@@ -108,12 +108,19 @@ def test_multibatch(model_path: str, trust_remote_code: bool | None) -> None:
 
 @pytest.mark.parametrize("chunk_size", [None, 64])
 @pytest.mark.parametrize("custom_prefill", [False, True])
-def test_generation_row_optimizations(monkeypatch, chunk_size, custom_prefill):
-    """Exercise the real generation loop; token-compare's forward loop bypasses it."""
+@pytest.mark.parametrize("adapter_name", ["hf_gemma4", "hf_gemma4_moe"])
+def test_generation_row_optimizations(
+    monkeypatch, chunk_size, custom_prefill, adapter_name
+):
+    """Check the adapter binding, one-row head, and custom callback precedence."""
+    from types import SimpleNamespace
+
     import torch
     from transformers import LlamaConfig, LlamaForCausalLM
 
-    from hf_adapters import hf_common, hf_gemma4
+    from hf_adapters import auto_spyre_model, hf_gemma4, hf_gemma4_moe
+
+    adapter = {"hf_gemma4": hf_gemma4, "hf_gemma4_moe": hf_gemma4_moe}[adapter_name]
 
     model = LlamaForCausalLM(
         LlamaConfig(
@@ -153,7 +160,6 @@ def test_generation_row_optimizations(monkeypatch, chunk_size, custom_prefill):
         key_caches,
         value_caches,
         cache_index,
-        _last_hidden_row_only=False,
     ):
         return hf_gemma4._run_forward(
             model,
@@ -163,38 +169,42 @@ def test_generation_row_optimizations(monkeypatch, chunk_size, custom_prefill):
             key_caches,
             value_caches,
             cache_index,
-            _last_hidden_row_only=_last_hidden_row_only,
         )
 
+    monkeypatch.setattr(
+        auto_spyre_model.AutoSpyreModel,
+        "from_pretrained",
+        classmethod(lambda cls, *args, **kwargs: model),
+    )
     inputs = torch.arange(65).reshape(1, 65) % 11
     outputs, writes = [], []
-    for copy_row, head_row in ((False, False), (True, False), (True, True)):
+    for module in (SimpleNamespace(_run_forward=adapter._run_forward), adapter):
+        monkeypatch.setattr(
+            auto_spyre_model, "resolve_adapter_module", lambda *a, **kw: module
+        )
+        auto_spyre_model.AutoSpyreModelForCausalLM.from_pretrained("test-model")
         head_rows.clear()
         cache_writes.clear()
         outputs.append(
-            hf_common.generate(
-                hf_gemma4._run_forward,
-                model,
+            model.generate(
                 inputs,
                 max_new_tokens=3,
                 do_sample=False,
                 eos_token_id=None,
                 prefill_chunk_size=chunk_size,
                 prefill_fn=prefill if custom_prefill else None,
-                _prefill_last_row_only=copy_row,
-                _generation_last_hidden_row_only=None if head_row else False,
                 return_dict_in_generate=True,
                 output_logits=True,
                 output_scores=True,
             )
         )
         writes.append(list(cache_writes))
-        if head_row:
+        if module is adapter and not custom_prefill:
             assert all(rows == 1 for rows in head_rows)
         else:
             assert head_rows[0] > 1
         assert head_rows[-2:] == [1, 1]  # Decode is unchanged.
-    assert writes[0] == writes[1] == writes[2]
+    assert writes[0] == writes[1]
     for output in outputs[1:]:
         assert torch.equal(outputs[0].sequences, output.sequences)
         for field in ("logits", "scores"):
@@ -203,41 +213,6 @@ def test_generation_row_optimizations(monkeypatch, chunk_size, custom_prefill):
             ):
                 assert control.shape == treatment.shape == (1, 11)
                 assert torch.equal(control, treatment)
-
-
-def test_generation_row_option_requires_supported_driver():
-    import torch
-
-    from hf_adapters.hf_common import (
-        _generation_forward_options,
-        supports_last_hidden_row,
-    )
-
-    def keyword_only(*args, _last_hidden_row_only=False):
-        pass
-
-    def positional_or_keyword(_last_hidden_row_only=False):
-        pass
-
-    def positional_only(_last_hidden_row_only=False, /):
-        pass
-
-    def variadic(*_last_hidden_row_only):
-        pass
-
-    for driver in (keyword_only, positional_or_keyword):
-        assert supports_last_hidden_row(driver)
-        for requested in (None, True):
-            assert _generation_forward_options(driver, requested) == {
-                "_last_hidden_row_only": True
-            }
-        assert _generation_forward_options(driver, False) == {}
-    for driver in (None, lambda **kwargs: None, torch.neg, positional_only, variadic):
-        assert not supports_last_hidden_row(driver)
-        assert _generation_forward_options(driver) == {}
-        assert _generation_forward_options(driver, False) == {}
-        with pytest.raises(ValueError, match="must declare"):
-            _generation_forward_options(driver, True)
 
 
 def test_prefill_logit_copy_has_only_the_selected_row():
@@ -252,3 +227,43 @@ def test_prefill_logit_copy_has_only_the_selected_row():
         selected.untyped_storage().nbytes()
         == selected.numel() * selected.element_size()
     )
+
+
+def test_token_compare_uses_one_generation_with_model_rules():
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from tests.spyre.test_e2e_token_compare_spyre import (
+        _compare_results,
+        adapter_greedy_steps,
+    )
+
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=11,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+        )
+    ).eval()
+    model.generation_config.suppress_tokens = [2]
+    model.generation_config.forced_bos_token_id = 3
+    calls = []
+
+    def forward(model, ids, positions, mask, keys, values, cache_index):
+        calls.append(ids.shape[1])
+        logits = torch.zeros(*ids.shape, 11)
+        logits[..., 2] = 5
+        return logits
+
+    results = adapter_greedy_steps(forward, model, torch.tensor([[1]]), num_decode=2)
+    assert len(calls) == 3
+    assert calls[1:] == [1, 1]
+    assert [result["token"] for result in results] == [3, 0, 0]
+    assert all(result["logits"].argmax().item() == 2 for result in results)
+    assert model.generation_config.suppress_tokens == [2]
+    wrong_token = [{**results[0], "token": 4}, *results[1:]]
+    with pytest.raises(AssertionError, match="HF token 3 != Spyre token 4"):
+        _compare_results(results, wrong_token, None, "test-model")

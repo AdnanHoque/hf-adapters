@@ -40,6 +40,7 @@ from hf_adapters.hf_gemma4 import (
     _gemma4_rms_norm,
     _run_backbone_forward,
     _run_forward,
+    _run_prefill_next_logits,
     _setup_gemma4_text_decoder,
 )
 
@@ -47,6 +48,7 @@ __all__ = [
     "prepare_for_spyre",
     "prepare_text_decoder_for_spyre",
     "_run_forward",
+    "_run_prefill_next_logits",
     "_run_backbone_forward",
 ]
 
