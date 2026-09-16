@@ -44,18 +44,17 @@ __all__ = [
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
-# Automatic for supported inputs and compilers. None selects automatically,
-# False is a comparison opt-out, True requires support before cache writes.
-# Requires the LX stack plus reader-compatible staging. The recorded performance
-# also used rewrite-preserved weight-copy proofs; those are not a safety gate.
+# Automatic for supported inputs and compilers. None selects automatically
+# (off when unsupported); True forces the schedule on and requires support
+# before cache writes. Requires the LX stack plus reader-compatible staging.
+# The recorded performance also used rewrite-preserved weight-copy proofs;
+# those are not a safety gate.
 _PREFILL_EXPERT_DIVISIONS = None
 
 
 def _prefill_expert_config():
     """Check supported compiler controls, scoped by the caller."""
     options = {"allow_all_ops_in_lx_planning": True}
-    if _PREFILL_EXPERT_DIVISIONS is False:
-        return options
     from torch_spyre._inductor import config
 
     if not hasattr(config, "consumer_compatible_input_staging"):
@@ -104,8 +103,6 @@ def _validate_prefill_expert_inputs(x, gate, up, down, routing_weight=None):
     [rows, hidden] form. Check both without copying or reshaping device data.
     Routing is produced later, so its shape is checked again inside the region.
     """
-    if _PREFILL_EXPERT_DIVISIONS is False:
-        return False
     shape = tuple(x.shape)
     input_ok = shape == (512, 2816) or (
         routing_weight is None
