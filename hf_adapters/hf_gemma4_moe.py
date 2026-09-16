@@ -35,7 +35,12 @@ from hf_adapters.hf_gemma4 import (
     _setup_gemma4_text_decoder,
 )
 
-__all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
+__all__ = [
+    "prepare_for_spyre",
+    "prepare_text_decoder_for_spyre",
+    "_run_forward",
+    "_run_backbone_forward",
+]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
@@ -406,25 +411,36 @@ def _moe_route_persistent_packed(
 def _moe_expert_persistent(x_expert, routing_weight, gate, up, down):
     """Evaluate every expert and sum their routed outputs on device."""
     from torch_spyre._inductor.propagate_hints import spyre_hint
-
-    experts, hidden, intermediate = gate.shape
+    from torch_spyre._inductor.wsr import for_each_tile
 
     use_divisions = _validate_prefill_expert_inputs(
         x_expert, gate, up, down, routing_weight
     ) and _prefill_expert_config().get("consumer_compatible_input_staging", False)
 
-    x = x_expert.unsqueeze(0)
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = routing_weight.permute(1, 0, 2).contiguous().clone()
 
-    with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": 32}):
+    def expert_body(acc, tiles):
+        x, route_tile, gate_tile, up_tile, down_tile = tiles
+        # Keep main's explicit loop/carry. These hints choose only the work
+        # division within one expert; they do not introduce another loop.
         with spyre_hint(work_div={"T": 8, "H": 4}) if use_divisions else nullcontext():
-            gate_out = torch.matmul(x, gate)
-            up_out = torch.matmul(x, up)
+            gate_out = torch.matmul(x, gate_tile)
+            up_out = torch.matmul(x, up_tile)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
         with spyre_hint(work_div={"T": 16, "H": 2}) if use_divisions else nullcontext():
-            down_out = torch.matmul(activated, down)
-        return (down_out * route).sum(dim=0)
+            down_out = torch.matmul(activated, down_tile)
+        return acc + (down_out * route_tile).squeeze(0), None
+
+    with spyre_hint(work_div={"T": 32}):
+        result, _ = for_each_tile(
+            expert_body,
+            (x_expert, route, gate, up, down),
+            dims=(None, 0, 0, 0, 0),
+            tile_size=1,
+            init=torch.zeros_like(x_expert),
+        )
+    return result
 
 
 class Gemma4MoEBlock(nn.Module):
@@ -710,8 +726,8 @@ def _prepare_experts(experts):
     experts.down_proj = _move_expert_weight(down)
 
 
-def prepare_for_spyre(model):
-    """Prepare a Gemma 4 MoE causal LM for Spyre in place."""
+def prepare_text_decoder_for_spyre(model):
+    """Prepare only the Gemma 4 MoE text decoder for Spyre in place."""
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre.model_utils import dma_moe_per_expert_scale_to_spyre
 
@@ -751,3 +767,8 @@ def prepare_for_spyre(model):
         blocks.append(block)
 
     model._spyre_compiled_blocks = blocks
+
+
+def prepare_for_spyre(model):
+    """Prepare a Gemma 4 MoE causal LM for Spyre in place."""
+    prepare_text_decoder_for_spyre(model)

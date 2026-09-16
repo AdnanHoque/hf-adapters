@@ -45,7 +45,7 @@ from tests.conftest import (
     resolve_adapter_module_for_test,
 )
 from tests.cpu.conftest import _unwrap_compiled_blocks
-from tests.model_registry import CAUSAL_PATHS
+from tests.model_registry import CAUSAL_PATHS, REMOTE_CODE_PATHS
 
 pytestmark = pytest.mark.model_harness("causal")
 
@@ -162,12 +162,18 @@ def adapter_greedy_steps(run_forward_fn, model, input_ids, num_decode=NUM_DECODE
 
 
 @pytest.mark.parametrize("model_path", CAUSAL_PATHS, ids=CAUSAL_PATHS)
-def test_auto_loader(model_path):
+def test_auto_loader(model_path, trust_remote_code):
     auto_spyre_model = sys.modules["hf_adapters.auto_spyre_model"]
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if trust_remote_code is None:
+        trust_remote_code = model_path in REMOTE_CODE_PATHS
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
 
     # Phase 1: auto-loader generate
-    model = auto_spyre_model.AutoSpyreModelForCausalLM.from_pretrained(model_path)
+    model = auto_spyre_model.AutoSpyreModelForCausalLM.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
     _unwrap_compiled_blocks(model)
     encoded = encode_generation_inputs(tokenizer, [PROMPT])
     auto_sequences = model.generate(
@@ -183,8 +189,12 @@ def test_auto_loader(model_path):
     gc.collect()
 
     # Phase 2: HF reference (fresh)
-    adapter_mod = resolve_adapter_module_for_test(model_path)
-    hf_model = load_ref_model(model_path, adapter_mod)
+    adapter_mod = resolve_adapter_module_for_test(
+        model_path, trust_remote_code=trust_remote_code
+    )
+    hf_model = load_ref_model(
+        model_path, adapter_mod, trust_remote_code=trust_remote_code
+    )
     encoded = encode_prompts(tokenizer, PROMPT)
     with torch.no_grad():
         hf_out = hf_model.generate(
@@ -351,3 +361,77 @@ def test_gemma_block_addresses_and_order(gemma_moe_compiler):
     assert torch.equal(u, torch.bmm(x, up[ids].reshape(4, 5, 7)))
     actual = moe._decode_down_output_blocks(g, down, ids, 2)
     assert torch.equal(actual, torch.bmm(g, down[ids].reshape(4, 7, 5)))
+
+
+@pytest.mark.parametrize("use_divisions", [False, True])
+def test_gemma_prefill_explicit_loop(gemma_moe_compiler, monkeypatch, use_divisions):
+    """Adapter-level carry and hint placement; device lowering is not tested here."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    moe, config = gemma_moe_compiler
+    config.consumer_compatible_input_staging = False
+    config.read_copy_elision = False
+    config.lx_planner_relayout = False
+    # Use tiny inputs for arithmetic; the real shape gate has its own test above.
+    monkeypatch.setattr(
+        moe, "_validate_prefill_expert_inputs", lambda *a: use_divisions
+    )
+    active, scopes, calls = [], [], []
+
+    @contextmanager
+    def hint(**kwargs):
+        scopes.append(kwargs)
+        active.append(kwargs)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def eager_tiles(body, operands, *, dims, tile_size, init):
+        calls.append((dims, tile_size, tuple(init.shape)))
+        assert active == [{"work_div": {"T": 32}}]
+        assert dims == (None, 0, 0, 0, 0) and tile_size == 1
+        acc = init
+        for e in range(operands[1].shape[0]):
+            tiles = tuple(
+                t if d is None else t.narrow(d, e, 1) for t, d in zip(operands, dims)
+            )
+            acc, output = body(acc, tiles)
+            assert output is None
+        return acc, None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_spyre._inductor.wsr",
+        SimpleNamespace(for_each_tile=eager_tiles),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_spyre._inductor.propagate_hints",
+        SimpleNamespace(spyre_hint=hint),
+    )
+    x = torch.arange(20).reshape(4, 5).double() % 3 - 1
+    gate = torch.arange(3 * 5 * 7).reshape(3, 5, 7).double() % 5 - 2
+    up, down = gate + 1, gate.transpose(1, 2).contiguous()
+    route = (
+        torch.tensor([[1, 0, 2], [0, 0, 0], [2, 1, 0], [1, 1, 1]])
+        .double()
+        .unsqueeze(-1)
+    )
+    actual = moe._moe_expert_persistent(x, route, gate, up, down)
+    expected = torch.zeros_like(x)
+    for e in range(3):
+        activated = torch.nn.functional.gelu(x @ gate[e], approximate="tanh") * (
+            x @ up[e]
+        )
+        expected = expected + (activated @ down[e]) * route[:, e]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert calls == [((None, 0, 0, 0, 0), 1, (4, 5))]
+    assert scopes[:2] == [{"named_dims": ["E", "T", "ONE"]}, {"work_div": {"T": 32}}]
+    assert scopes[2:] == (
+        [{"work_div": {"T": 8, "H": 4}}, {"work_div": {"T": 16, "H": 2}}] * 3
+        if use_divisions
+        else []
+    )
+    assert not active
