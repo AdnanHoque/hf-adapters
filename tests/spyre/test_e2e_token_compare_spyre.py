@@ -33,6 +33,7 @@ from transformers import PreTrainedModel
 from hf_adapters.auto_spyre_model import dtype_for_model_path
 from hf_adapters.hf_common import (
     generate,
+    generation_driver,
     move_model_to_spyre,
 )
 from tests.conftest import (
@@ -223,7 +224,7 @@ def _run_model_test(
     move_model_to_spyre(model=model, module=adapter, dtype=spyre_dtype)
     print("  Running adapter on Spyre ...")
     adapter_results = adapter_greedy_steps(
-        getattr(adapter, "_run_prefill_next_logits", adapter._run_forward),
+        generation_driver(adapter),
         model,
         input_ids,
         num_decode=num_decode,

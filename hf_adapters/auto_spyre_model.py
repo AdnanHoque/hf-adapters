@@ -466,10 +466,10 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
             if hasattr(module, "generate"):
                 return module.generate(self, input_ids, attention_mask, **kwargs)
 
-            from hf_adapters.hf_common import generate
+            from hf_adapters.hf_common import generate, generation_driver
 
             return generate(
-                getattr(module, "_run_prefill_next_logits", module._run_forward),
+                generation_driver(module),
                 self,
                 input_ids,
                 attention_mask=attention_mask,

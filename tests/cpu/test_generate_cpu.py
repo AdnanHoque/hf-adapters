@@ -86,7 +86,7 @@ def test_multibatch(model_path: str, trust_remote_code: bool | None) -> None:
     )
     _set_rope_dtype(model, dtype)
     sequences = hf_common_mod.generate(
-        getattr(adapter_mod, "_run_prefill_next_logits", adapter_mod._run_forward),
+        hf_common_mod.generation_driver(adapter_mod),
         model,
         **encoded,
         max_new_tokens=MAX_NEW_TOKENS,
@@ -118,7 +118,7 @@ def test_generation_row_optimizations(
     import torch
     from transformers import LlamaConfig, LlamaForCausalLM
 
-    from hf_adapters import auto_spyre_model, hf_gemma4, hf_gemma4_moe
+    from hf_adapters import auto_spyre_model, hf_common, hf_gemma4, hf_gemma4_moe
 
     adapter = {"hf_gemma4": hf_gemma4, "hf_gemma4_moe": hf_gemma4_moe}[adapter_name]
 
@@ -180,7 +180,10 @@ def test_generation_row_optimizations(
     )
     inputs = torch.arange(65).reshape(1, 65) % 11
     outputs, writes = [], []
-    for module in (SimpleNamespace(_run_forward=adapter._run_forward), adapter):
+    plain = SimpleNamespace(_run_forward=adapter._run_forward)
+    assert hf_common.generation_driver(plain) is adapter._run_forward
+    assert hf_common.generation_driver(adapter) is adapter._run_prefill_next_logits
+    for module in (plain, adapter):
         monkeypatch.setattr(
             auto_spyre_model, "resolve_adapter_module", lambda *a, **kw: module
         )
