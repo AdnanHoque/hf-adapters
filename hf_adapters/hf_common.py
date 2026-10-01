@@ -2635,16 +2635,6 @@ def select_next_token(
     return (tokens, scores) if return_scores else tokens
 
 
-def generation_driver(module):
-    """Return the adapter callable that ``generate`` drives.
-
-    An adapter may expose ``_run_prefill_next_logits`` (same arguments as
-    ``_run_forward``, final row only); otherwise ``_run_forward`` is used.
-    Generation and its tests share this one choice so they cannot drift.
-    """
-    return getattr(module, "_run_prefill_next_logits", module._run_forward)
-
-
 def generate(
     run_forward_fn: Optional[Callable],
     model,
@@ -2669,7 +2659,7 @@ def generate(
     """Model-agnostic generation: optional chunked prefill, then token decode.
 
     When attached to a model via ``auto_spyre_model.py`` (which binds
-    ``run_forward_fn`` to the adapter's generation driver), callers use
+    ``run_forward_fn`` to the adapter module's ``_run_forward``), callers use
     the stock input and tensor-output shape::
 
         encoded = tokenizer(["Hello!"], return_tensors="pt", padding=True)

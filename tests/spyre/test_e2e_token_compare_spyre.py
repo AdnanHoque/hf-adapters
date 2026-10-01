@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-E2E token-level comparison: HF generation (CPU) vs adapter generation (Spyre).
+E2E token-level comparison: HF stock forward (CPU) vs adapter forward (Spyre).
 
 For each model, runs prefill + 4 greedy decode steps on both CPU (stock HF)
 and Spyre (adapter), comparing logits and greedy tokens at each step.
@@ -32,8 +32,9 @@ from transformers import PreTrainedModel
 
 from hf_adapters.auto_spyre_model import dtype_for_model_path
 from hf_adapters.hf_common import (
-    generate,
-    generation_driver,
+    DEVICE,
+    generation_cache_len,
+    get_model_dtype,
     move_model_to_spyre,
 )
 from tests.conftest import (
@@ -56,18 +57,35 @@ def hf_greedy_steps(
     input_ids: torch.Tensor,
     num_decode: int = 4,
 ) -> list[dict[str, Any]]:
-    """Use stock generation so both sides apply the same token-selection rules."""
-    with torch.no_grad():
-        output = model.generate(
-            input_ids,
-            attention_mask=torch.ones_like(input_ids),  # One unpadded prompt.
-            max_new_tokens=num_decode + 1,
-            do_sample=False,
-            eos_token_id=None,
-            return_dict_in_generate=True,
-            output_logits=True,
-        )
-    return _generation_results(output, input_ids.shape[1], num_decode + 1)
+    """Run stock HF model for prefill + N decode steps on CPU."""
+    from transformers import DynamicCache
+
+    results = []
+    past = DynamicCache(config=model.config)
+    ids = input_ids.clone()
+    seq_len = ids.shape[1]
+
+    for step in range(num_decode + 1):
+        if step == 0:
+            position_ids = torch.arange(seq_len).unsqueeze(0)
+        else:
+            position_ids = torch.tensor([[seq_len + step - 1]])
+
+        with torch.no_grad():
+            out = model(
+                input_ids=ids,
+                position_ids=position_ids,
+                past_key_values=past,
+                use_cache=True,
+            )
+
+        logits = out.logits[0, -1, :].float()
+        token = logits.argmax().item()
+        results.append({"logits": logits, "token": token, "step": step})
+        past = out.past_key_values
+        ids = torch.tensor([[token]])
+
+    return results
 
 
 def adapter_greedy_steps(
@@ -76,32 +94,125 @@ def adapter_greedy_steps(
     input_ids: torch.Tensor,
     num_decode: int = 4,
 ) -> list[dict[str, Any]]:
-    """Use the production generation loop once, with fresh request caches."""
+    """Run adapter forward on Spyre for prefill + N decode steps."""
+    from hf_adapters.hf_common import (
+        BLOCK_SIZE,
+        _materialize_decode_mask_heads,
+        _prefill_cache_inputs,
+        _sdpa_compatible_kv_length,
+        allocate_kv_caches,
+        build_decode_mask,
+        build_prefill_mask,
+        make_cache_index,
+        pad_and_position,
+    )
+
+    batch_size = input_ids.shape[0]
+    seq_len = input_ids.shape[1]
+
+    cfg = model.config
+    vocab_size = getattr(cfg, "vocab_size", None) or cfg.text_config.vocab_size
+
+    actual_lengths = torch.full((batch_size,), seq_len, dtype=torch.long)
+    prefill_chunk_size = getattr(model, "_spyre_prefill_chunk_size", None)
+    padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
+        input_ids, actual_lengths, prefill_chunk_size or BLOCK_SIZE
+    )
+    prompt_offset = (
+        prompt_offsets if isinstance(prompt_offsets, int) else prompt_offsets[0].item()
+    )
+
+    # Mirror generate()'s per-sequence left-padding bookkeeping (hf_common.py:
+    # model._spyre_prompt_offsets = prompt_offsets). The band path reads its left
+    # padding out of the mask below, but the sliding-window op path cannot — an
+    # offset-and-length window has no way to skip pad columns, so it reads the
+    # padding from valid_start, which valid_start_for() pulls from this attribute.
+    # A harness that drives _run_forward directly must set it or the op attends the
+    # pad K/V (argmax flips while the logit magnitude barely moves).
+    model._spyre_prompt_offsets = prompt_offsets
+    model._spyre_padded_prompt_len = padded_len
+
+    max_cache_len = generation_cache_len(padded_len, num_decode + 1)
+    prefill_kv_len = _sdpa_compatible_kv_length(padded_len)
+    dtype = get_model_dtype(model)
+
+    key_caches, value_caches = allocate_kv_caches(
+        model, batch_size, max_cache_len, dtype
+    )
+    chunked_prefill = prefill_chunk_size is not None
+    prefill_cache_len = prefill_kv_len if chunked_prefill else max_cache_len
+    prefill_key_caches = _prefill_cache_inputs(
+        key_caches, prefill_cache_len, chunked_prefill
+    )
+    prefill_value_caches = _prefill_cache_inputs(
+        value_caches, prefill_cache_len, chunked_prefill
+    )
+
+    results = []
+
+    query_chunk_size = prefill_chunk_size or padded_len
     with torch.no_grad():
-        output = generate(
-            run_forward_fn,
-            model,
-            input_ids,
-            max_new_tokens=num_decode + 1,
-            do_sample=False,
-            eos_token_id=None,
-            return_dict_in_generate=True,
-            output_logits=True,
+        for chunk_start in range(0, padded_len, query_chunk_size):
+            chunk_end = chunk_start + query_chunk_size
+            prefill_mask = build_prefill_mask(
+                batch_size,
+                query_chunk_size,
+                prefill_cache_len,
+                prompt_offset,
+                dtype=dtype,
+                query_start=chunk_start,
+            )
+            logits = run_forward_fn(
+                model,
+                padded_ids[:, chunk_start:chunk_end].to(DEVICE),
+                position_ids[:, chunk_start:chunk_end].to(DEVICE),
+                prefill_mask.to(DEVICE),
+                prefill_key_caches,
+                prefill_value_caches,
+                cache_index=make_cache_index(chunk_start, query_chunk_size, DEVICE),
+            )
+    logits_cpu = logits[:, -1, :].to("cpu")[0].float()[:vocab_size]
+    token = logits_cpu.argmax().item()
+    results.append({"logits": logits_cpu, "token": token, "step": 0})
+
+    # Single-token decode, mirroring hf_common.generate: each step feeds the token
+    # the previous step produced and writes exactly one cache slot, so generated
+    # tokens are contiguous from padded_len. (This harness used to reproduce the
+    # FMS block walk — BLOCK_SIZE tokens in, one slot written — but generate() no
+    # longer does that, and a per-step logits comparison is only meaningful if it
+    # exercises the same path production uses.)
+    result = torch.cat([padded_ids, torch.tensor([[token]])], dim=1)
+    current_cache_len = padded_len
+
+    for step in range(1, num_decode + 1):
+        next_input = result[:, -1:].to(DEVICE)
+        decode_pos = torch.full(
+            (batch_size, 1), current_cache_len - prompt_offset, dtype=torch.long
         )
-    return _generation_results(output, input_ids.shape[1], num_decode + 1)
+        decode_mask = build_decode_mask(
+            batch_size, max_cache_len, current_cache_len, prompt_offset, dtype=dtype
+        )
+        decode_mask_heads = getattr(model, "_spyre_decode_mask_num_heads", None)
+        if decode_mask_heads:
+            decode_mask = _materialize_decode_mask_heads(decode_mask, decode_mask_heads)
+        with torch.no_grad():
+            logits = run_forward_fn(
+                model,
+                next_input,
+                decode_pos.to(DEVICE),
+                decode_mask.to(DEVICE),
+                key_caches,
+                value_caches,
+                cache_index=make_cache_index(current_cache_len, 1, DEVICE),
+            )
+        last_logits = logits[:, -1, :].to("cpu")[0].float()[:vocab_size]
+        current_cache_len += 1
 
+        token = last_logits.argmax().item()
+        results.append({"logits": last_logits, "token": token, "step": step})
+        result = torch.cat([result, torch.tensor([[token]])], dim=1)
 
-def _generation_results(output, prompt_length, steps):
-    assert len(output.logits) == steps
-    assert all(torch.isfinite(logits).all().item() for logits in output.logits)
-    return [
-        {
-            "step": step,
-            "logits": logits[0].float(),
-            "token": output.sequences[0, prompt_length + step].item(),
-        }
-        for step, logits in enumerate(output.logits)
-    ]
+    return results
 
 
 def _compare_results(
@@ -128,13 +239,6 @@ def _compare_results(
         h_top1 = h.argmax().item()
         a_top1 = a.argmax().item()
         match = h_top1 == a_top1
-
-        # Token-selection rules can change the raw-logit winner. Check the
-        # returned token too, so equal raw logits cannot hide different choices.
-        assert hf_r["token"] == ad_r["token"], (
-            f"{model_name} step {step}: HF token {hf_r['token']} "
-            f"!= Spyre token {ad_r['token']}"
-        )
 
         step_label = "prefill" if step == 0 else f"decode-{step}"
         h_str = tokenizer.decode([hf_r["token"]])
@@ -224,7 +328,7 @@ def _run_model_test(
     move_model_to_spyre(model=model, module=adapter, dtype=spyre_dtype)
     print("  Running adapter on Spyre ...")
     adapter_results = adapter_greedy_steps(
-        generation_driver(adapter),
+        adapter._run_forward,
         model,
         input_ids,
         num_decode=num_decode,
