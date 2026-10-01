@@ -84,6 +84,10 @@ from transformers import (
     Phi3Config,
     PreTrainedModel,
     Qwen2Config,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
     Qwen3Config,
     RobertaConfig,
     SmolLM3Config,
@@ -96,6 +100,9 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
+from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+    DiffusionGemmaConfig,
+)
 from transformers.models.ministral.configuration_ministral import MinistralConfig
 from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 
@@ -104,6 +111,7 @@ from hf_adapters import (
     hf_bert,
     hf_bharatgen,
     hf_clip,
+    hf_diffusion_gemma,
     hf_distilbert,
     hf_dspark_gemma4,
     hf_dspark_granite,
@@ -136,6 +144,8 @@ from hf_adapters import (
     hf_phi3,
     hf_qwen2,
     hf_qwen3,
+    hf_qwen3_5,
+    hf_qwen3_5_moe,
     hf_smollm3,
     hf_xlm_roberta,
 )
@@ -151,6 +161,7 @@ from hf_adapters.hf_common import (
 CONFIG_TO_ADAPTER_MODULE_MAPPING: dict[type[PretrainedConfig], ModuleType] = {
     BertConfig: hf_bert,
     CLIPConfig: hf_clip,
+    DiffusionGemmaConfig: hf_diffusion_gemma,
     DistilBertConfig: hf_distilbert,
     Gemma2Config: hf_gemma2,
     Gemma3Config: hf_gemma3,
@@ -180,6 +191,10 @@ CONFIG_TO_ADAPTER_MODULE_MAPPING: dict[type[PretrainedConfig], ModuleType] = {
     Phi3Config: hf_phi3,
     Qwen2Config: hf_qwen2,
     Qwen3Config: hf_qwen3,
+    Qwen3_5Config: hf_qwen3_5,
+    Qwen3_5TextConfig: hf_qwen3_5,
+    Qwen3_5MoeConfig: hf_qwen3_5_moe,
+    Qwen3_5MoeTextConfig: hf_qwen3_5_moe,
     RobertaConfig: hf_xlm_roberta,
     SmolLM3Config: hf_smollm3,
     XLMRobertaConfig: hf_xlm_roberta,
@@ -309,8 +324,11 @@ def dtype_for_model_path(
         config = _autoconfig_with_subfolder_fallback(
             model_name_or_path, trust_remote_code=trust_remote_code
         )
+        text_config = getattr(config, "text_config", None)
         dtype = (
-            getattr(config, "dtype", None) or torch.float16 if config else torch.float16
+            getattr(text_config, "dtype", None)
+            or getattr(config, "dtype", None)
+            or torch.float16
         )
 
     if dtype == torch.float32 and device_str == "spyre":
@@ -445,6 +463,9 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
             attention_mask: torch.Tensor | None = None,
             **kwargs: Any,
         ):
+            if hasattr(module, "generate"):
+                return module.generate(self, input_ids, attention_mask, **kwargs)
+
             from hf_adapters.hf_common import generate
 
             return generate(

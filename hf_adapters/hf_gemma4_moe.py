@@ -25,11 +25,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hf_adapters import hf_common
 from hf_adapters.hf_common import (
     moe_decode_selected_experts,
     moe_prefill_all_experts,
     moe_topk,
-    named_moe_prefill_inputs,
     optional_spyre_config_patch,
     prepare_moe_expert_weights,
     text_config,
@@ -42,7 +42,19 @@ from hf_adapters.hf_gemma4 import (
     _run_forward,
     _run_prefill_next_logits,
     _setup_gemma4_text_decoder,
+    spyre_tp_grouped_colwise_modules,
 )
+from hf_adapters.spyre_tensor_parallel import spyre_compiled_all_reduce
+from hf_adapters.swa_attention import allocate_swa_caches
+
+# The HF checkpoint conversion first merges each expert's 2D gate/up tensors
+# into these 3D parameters.  Keep the local TP shards on CPU until
+# ``_prepare_experts`` performs its split/transpose/pad and one final custom
+# DMA, avoiding a Spyre -> CPU -> Spyre round trip.
+SPYRE_TP_CPU_STAGED_MODULES = {
+    "model.language_model.layers.*.experts.gate_up_proj",
+    "model.language_model.layers.*.experts.down_proj",
+}
 
 __all__ = [
     "prepare_for_spyre",
@@ -50,6 +62,7 @@ __all__ = [
     "_run_forward",
     "_run_prefill_next_logits",
     "_run_backbone_forward",
+    "spyre_tp_grouped_colwise_modules",
 ]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
@@ -329,6 +342,10 @@ class Gemma4MoEBlock(nn.Module):
         is_kv_eq_v,
         moe_k,
         stick_size,
+        is_sliding=False,
+        window_size=None,
+        swa_mode=None,
+        is_causal=True,
     ):
         super().__init__()
         self.self_attn = Gemma4Attention(
@@ -337,6 +354,10 @@ class Gemma4MoEBlock(nn.Module):
             num_kv_heads,
             head_dim,
             is_kv_eq_v,
+            is_sliding=is_sliding,
+            window_size=window_size,
+            swa_mode=swa_mode,
+            is_causal=is_causal,
         )
         self.mlp = layer.mlp
         self.input_layernorm = layer.input_layernorm
@@ -344,6 +365,12 @@ class Gemma4MoEBlock(nn.Module):
         self.pre_feedforward_layernorm = layer.pre_feedforward_layernorm
         self.post_feedforward_layernorm = layer.post_feedforward_layernorm
         self.experts = layer.experts
+        self._tp_device_mesh = getattr(self.experts, "_hf_device_mesh", None)
+        self._tp_group_name = (
+            self._tp_device_mesh.get_group().group_name
+            if self._tp_device_mesh is not None
+            else None
+        )
         self.router = layer.router
         self.post_feedforward_layernorm_1 = layer.post_feedforward_layernorm_1
         self.pre_feedforward_layernorm_2 = layer.pre_feedforward_layernorm_2
@@ -356,14 +383,24 @@ class Gemma4MoEBlock(nn.Module):
         self._moe_k = moe_k
         self._stick_size = stick_size
         self._moe_rms_eps = self.router.eps
+        decode_forward = (
+            self._full_tp_decode_forward
+            if self._tp_device_mesh is not None
+            else self._full_decode_forward
+        )
+        prefill_ffn = (
+            self._tp_prefill_ffn
+            if self._tp_device_mesh is not None
+            else self._prefill_ffn
+        )
         self._compiled_decode = torch.compile(
-            self._full_decode_forward, dynamic=False, fullgraph=True
+            decode_forward, dynamic=False, fullgraph=True
         )
         self._compiled_prefill_attn = torch.compile(
             self._attn_forward, dynamic=False, fullgraph=True
         )
         self._compiled_prefill_ffn = torch.compile(
-            self._prefill_ffn, dynamic=False, fullgraph=True
+            prefill_ffn, dynamic=False, fullgraph=True
         )
         self.train(layer.training)
 
@@ -430,6 +467,36 @@ class Gemma4MoEBlock(nn.Module):
         return self._decode_ffn(hidden_states, layer_scalar), key_cache, value_cache
 
     def _decode_ffn(self, residual, layer_scalar):
+        dense_out, moe_out = self._decode_ffn_local(residual)
+        return self._finish_ffn(residual, dense_out, moe_out, layer_scalar)
+
+    def _tp_decode_ffn(self, residual, layer_scalar):
+        dense_out, moe_out = self._decode_ffn_local(residual)
+        moe_out = spyre_compiled_all_reduce(moe_out, self._tp_group_name)
+        return self._finish_ffn(residual, dense_out, moe_out, layer_scalar)
+
+    def _full_tp_decode_forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        value_cache,
+        cache_index,
+        layer_scalar,
+    ):
+        hidden_states, key_cache, value_cache = self._attn_forward(
+            hidden_states,
+            selected_freqs,
+            attn_mask,
+            key_cache,
+            value_cache,
+            cache_index,
+        )
+        hidden_states = self._tp_decode_ffn(hidden_states, layer_scalar)
+        return hidden_states, key_cache, value_cache
+
+    def _decode_ffn_local(self, residual):
         hidden_size = residual.shape[-1]
         dense_out = self._dense_forward(residual)
         router_input = residual.reshape(-1, hidden_size)
@@ -455,9 +522,12 @@ class Gemma4MoEBlock(nn.Module):
             self._stick_size,
             self._moe_rms_eps,
         )
-        moe_out = moe_out.to(expert_input.dtype).reshape_as(residual)
+        moe_out = moe_out.to(expert_input.dtype)
+        return dense_out, moe_out
+
+    def _finish_ffn(self, residual, dense_out, moe_out, layer_scalar):
         moe_out = _gemma4_rms_norm(
-            moe_out,
+            moe_out.reshape_as(residual),
             self.post_feedforward_layernorm_2.weight,
             self.post_feedforward_layernorm_2.eps,
         )
@@ -469,6 +539,15 @@ class Gemma4MoEBlock(nn.Module):
         return (residual + ffn_out) * layer_scalar
 
     def _prefill_ffn(self, residual, layer_scalar):
+        dense_out, moe_out = self._prefill_ffn_local(residual)
+        return self._finish_ffn(residual, dense_out, moe_out, layer_scalar)
+
+    def _tp_prefill_ffn(self, residual, layer_scalar):
+        dense_out, moe_out = self._prefill_ffn_local(residual)
+        moe_out = spyre_compiled_all_reduce(moe_out, self._tp_group_name)
+        return self._finish_ffn(residual, dense_out, moe_out, layer_scalar)
+
+    def _prefill_ffn_local(self, residual):
         router_input = residual.reshape(-1, residual.shape[-1])
         dense_out = self._dense_forward(residual)
         expert_input = _gemma4_rms_norm(
@@ -496,18 +575,8 @@ class Gemma4MoEBlock(nn.Module):
             experts.up_proj,
             experts.down_proj,
         )
-        moe_out = _gemma4_rms_norm(
-            moe_out.to(residual.dtype).reshape_as(residual),
-            self.post_feedforward_layernorm_2.weight,
-            self.post_feedforward_layernorm_2.eps,
-        )
-        ffn_input = dense_out + moe_out
-        ffn_out = _gemma4_rms_norm(
-            ffn_input,
-            self.post_feedforward_layernorm.weight,
-            self.post_feedforward_layernorm.eps,
-        )
-        return (residual + ffn_out) * layer_scalar
+        moe_out = moe_out.to(residual.dtype)
+        return dense_out, moe_out
 
     def forward(
         self,
@@ -537,16 +606,8 @@ class Gemma4MoEBlock(nn.Module):
                 value_cache,
                 cache_index,
             )
-            with named_moe_prefill_inputs(
-                hidden_states,
-                experts.gate_proj,
-                experts.up_proj,
-                experts.down_proj,
-            ):
-                with optional_spyre_config_patch(prefill_options):
-                    hidden_states = self._compiled_prefill_ffn(
-                        hidden_states, layer_scalar
-                    )
+            with optional_spyre_config_patch(prefill_options):
+                hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
         else:
             # Do not enable the slower route-only configuration on an older
             # compiler. Both the wrapper and region use this same eligibility.
@@ -588,6 +649,12 @@ def prepare_text_decoder_for_spyre(model):
     num_q_heads, kv_shapes, kv_equals_v = _setup_gemma4_text_decoder(
         model, allow_moe=True
     )
+    if not hasattr(model, "_spyre_swa_mode"):
+        model._spyre_swa_mode = "anchored"
+    if not hasattr(model, "_spyre_swa_is_causal"):
+        model._spyre_swa_is_causal = True
+    if model._spyre_swa_mode == "anchored":
+        model._spyre_cache_allocator = allocate_swa_caches
 
     blocks = []
     for i, layer in enumerate(list(backbone.layers)):
@@ -599,15 +666,26 @@ def prepare_text_decoder_for_spyre(model):
             kv_equals_v[i],
             moe_k,
             stick_size,
+            is_sliding=cfg.layer_types[i] == "sliding_attention",
+            window_size=cfg.sliding_window,
+            swa_mode=model._spyre_swa_mode,
+            is_causal=model._spyre_swa_is_causal,
         )
-        expert_scale = block.router.per_expert_scale.detach()
+        # Under TP this parameter was loaded directly on Spyre.  Widening the
+        # per-expert scalar to one stick is intentionally a host operation.
+        expert_scale = block.router.per_expert_scale.detach().cpu()
         block.router.route_identity = torch.eye(
             stick_size, dtype=expert_scale.dtype
-        ).to("spyre")
-        block.router.per_expert_scale_stick = dma_moe_per_expert_scale_to_spyre(
-            expert_scale
-        )
-        prepare_moe_expert_weights(block.experts)
+        ).to(hf_common.DEVICE)
+        if str(hf_common.DEVICE).startswith("spyre"):
+            block.router.per_expert_scale_stick = dma_moe_per_expert_scale_to_spyre(
+                expert_scale
+            )
+        else:
+            block.router.per_expert_scale_stick = (
+                expert_scale[:, None].expand(-1, stick_size).contiguous()
+            )
+        prepare_moe_expert_weights(block.experts, pad_to_multiple=stick_size)
         backbone.layers[i] = block
         blocks.append(block)
 

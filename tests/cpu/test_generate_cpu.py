@@ -132,11 +132,13 @@ def test_generation_row_optimizations(
             num_key_value_heads=1,
         )
     ).eval()
-    model.config.final_logit_softcapping = 3.0
     # Include a padded vocabulary entry: generation must still crop it.
     model.lm_head = torch.nn.Linear(4, 12, bias=False)
     with torch.no_grad():
         model.lm_head.weight.copy_(torch.arange(48).reshape(12, 4) % 5)
+    # Both drivers reach the head through run_lm_head; install an eager
+    # softcapped head callable in place of the compiled one setup installs.
+    model._spyre_lm_head_forward = lambda h: torch.tanh(model.lm_head(h) / 3.0) * 3.0
     head_rows, cache_writes = [], []
 
     def backbone(model, ids, positions, mask, keys, values, cache_index):
@@ -213,20 +215,6 @@ def test_generation_row_optimizations(
             ):
                 assert control.shape == treatment.shape == (1, 11)
                 assert torch.equal(control, treatment)
-
-
-def test_prefill_logit_copy_has_only_the_selected_row():
-    import torch
-
-    from hf_adapters.hf_common import _prefill_next_logits
-
-    full = torch.arange(2 * 64 * 12).reshape(2, 64, 12).float()
-    selected = _prefill_next_logits(full)
-    assert torch.equal(selected, full[:, -1, :])
-    assert (
-        selected.untyped_storage().nbytes()
-        == selected.numel() * selected.element_size()
-    )
 
 
 def test_token_compare_uses_one_generation_with_model_rules():

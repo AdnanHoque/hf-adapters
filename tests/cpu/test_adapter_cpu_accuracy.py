@@ -439,8 +439,8 @@ def test_gemma_prefill_explicit_loop(gemma_moe_compiler, monkeypatch, use_divisi
         expected = expected + (activated @ down[e]) * route[:, e]
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert calls == [((None, 0, 0, 0, 0), 1, (4, 5))]
-    assert scopes[:2] == [{"named_dims": ["E", "T", "ONE"]}, {"work_div": {"T": 32}}]
-    assert scopes[2:] == (
+    assert scopes[:1] == [{"work_div": {"T": 32}}]
+    assert scopes[1:] == (
         [{"work_div": {"T": 8, "H": 4}}, {"work_div": {"T": 16, "H": 2}}] * 3
         if use_divisions
         else []

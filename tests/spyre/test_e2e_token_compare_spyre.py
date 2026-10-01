@@ -32,11 +32,14 @@ from transformers import PreTrainedModel
 
 from hf_adapters.auto_spyre_model import dtype_for_model_path
 from hf_adapters.hf_common import (
-    encode_prompts,
     generate,
     move_model_to_spyre,
 )
-from tests.conftest import load_ref_model, resolve_adapter_module_for_test
+from tests.conftest import (
+    encode_generation_inputs,
+    load_ref_model,
+    resolve_adapter_module_for_test,
+)
 from tests.model_registry import (
     CAUSAL_PATHS,
     NON_BLOCKING_CAUSAL_MODELS,
@@ -201,10 +204,9 @@ def _run_model_test(
     )
 
     prompt = "The capital of France is"
-    # Tokenize following the model's canonical scheme (chat template for
-    # instruct models, plain post-processing for base models). The same IDs feed
-    # the HF reference and Spyre adapter, keeping the comparison symmetric.
-    encoded = encode_prompts(tokenizer, prompt)
+    # The same IDs feed the HF reference and Spyre adapter, keeping the
+    # comparison symmetric.
+    encoded = encode_generation_inputs(tokenizer, [prompt])
     input_ids = encoded["input_ids"]
     print(f"  Prompt: {prompt!r} ({input_ids.shape[1]} tokens)")
 

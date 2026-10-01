@@ -10,6 +10,9 @@ which models are supported on Spyre.
 | Model | model\_type | head\_dim | D/2 | Stick Aligned | CPU Accurate | Spyre Compiles | Spyre Runs |
 |-------|-----------|---------|-----|--------------|-------------|---------------|-----------|
 | Qwen3 0.6B | qwen3 | 128 | 64 | Yes | Yes | Yes | Yes |
+| Qwen3.5 2B | qwen3\_5 | 256 (64 rotary) | 32 rotary | Yes | Yes | Yes | Yes |
+| Qwen3.8 27B | qwen3\_5 | 256 (64 rotary) | 32 rotary | Yes | Yes | Yes | Yes |
+| Qwen3.6 35B-A3B | qwen3\_5\_moe | 256 (64 rotary) | 32 rotary | Yes | Yes | Yes | Yes (single card and 2-card TP) |
 | LFM2 350M | lfm2 | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
 | Granite 3.3 8B | granite | 128 | 64 | Yes | Yes | Yes | Yes |
 | Granite 3.3 2B | granite | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
@@ -49,6 +52,17 @@ which models are supported on Spyre.
 **CPU Accurate** = adapter produces identical greedy tokens to stock HF on CPU.
 **Spyre Compiles** = `torch.compile(block_forward)` succeeds on Spyre.
 **Spyre Runs** = block produces output (no crash/NaN).
+
+### Diffusion LM (block-diffusion)
+
+| Model | model\_type | head\_dim | D/2 | Stick Aligned | Spyre Compiles | Spyre Runs |
+|-------|-----------|---------|-----|--------------|---------------|-----------|
+| DiffusionGemma 26B-A4B-it (bf16, TP=2) | diffusion\_gemma | 256 / 512 | 128 / 256 | Yes | Yes | Yes |
+
+**Spyre Compiles** = `torch.compile(encoder_block)` and `torch.compile(decoder_block)` succeed on Spyre.
+**Spyre Runs** = block-diffusion generate loop produces coherent text (verified: "Why is the sky blue?" → multi-paragraph Rayleigh scattering answer, bf16, TP=2).
+
+CPU Accurate does not apply: DiffusionGemma has no greedy AR token sequence to compare — correctness is assessed by output coherence on Spyre directly. MoE router + experts run on CPU at every layer by design (nonzero + Python loop over alive experts, not compilable).
 
 **Gemma 4 26B-A4B (MoE):** 128 experts, top-8 routing. Prefill uses a persistent
 expert loop (all experts evaluated, routed via `keep_by_index` + coarse-tile
@@ -171,8 +185,8 @@ all pass that check.
 > adapter or verify a checkpoint, update *only* this file (and the badge
 > counts in README.md, noted below).
 
-**Coverage:** 37 adapters · 58 verified checkpoints · 10K+ compatible models.
-The 59 verified rows are 36 generative + 13 embedding + 2 seq-classification +
+**Coverage:** 39 adapters · 62 verified checkpoints · 10K+ compatible models.
+The 62 verified rows are 39 generative + 13 embedding + 2 seq-classification +
 2 token-classification + 6 vision-language (see the Verified Checkpoints tables
 above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components
 used by VLM adapters and are not included in the adapter count. The three DSpark
@@ -197,6 +211,8 @@ pattern, norms, and weight layout.
 | hf\_qwen2.py | qwen2 | 3 | Qwen2 0.5B/1.5B/7B, Qwen2.5 0.5B/3B, Qwen2.5-Coder 0.5B–7B, Qwen2.5-Math 1.5B/7B |
 | hf\_granite.py | granite | 3 | Granite 3.3 8B/2B Base, Granite 3.2 8B, Granite 3.1 8B/2B, Granite 3.0 8B, Granite Code 8B/3B |
 | hf\_qwen3.py | qwen3 | 2 | Qwen3 1.7B, Qwen3 4B, Qwen3 8B |
+| hf\_qwen3\_5.py | qwen3\_5 / qwen3\_5\_text | 2 | Qwen3.5/3.6/3.8 dense checkpoints with hybrid Gated DeltaNet/full-attention layers; stateful recurrence is CPU-staged between compiled Spyre regions |
+| hf\_qwen3\_5\_moe.py | qwen3\_5\_moe / qwen3\_5\_moe\_text | 1 | Qwen3.5/3.6 35B-A3B routed/shared-expert variants |
 | hf\_mistral.py | mistral | 2 | Mistral 7B v0.1/v0.2, Mistral 7B Instruct v0.1–v0.3, Zephyr 7B |
 | hf\_mistral3.py | mistral3 | 2 | Mistral-Small-3.2 24B, Ministral-3 14B (multimodal text decoder) |
 | hf\_ministral.py | ministral | 1 | Ministral-8B Instruct fine-tunes |
@@ -208,6 +224,7 @@ pattern, norms, and weight layout.
 | hf\_gemma4.py | gemma4\_unified / gemma4 (dense + PLE/KV-share) | 4 | Gemma 4 31B (dense). Not 26B-A4B (MoE). |
 | hf\_gemma4\_mm.py | gemma4\_unified / gemma4 (multimodal) | 4 | Encoder-free dense unified VLMs plus full-vision PLE/KV-share and MoE variants. Combined MoE+PLE/KV-share remains unsupported. |
 | hf\_gemma4\_moe.py | gemma4 (MoE, `enable_moe_block`) | 1 | Gemma 4 26B-A4B (128 experts, top-8 routing). Persistent prefill + gathered decode, 5/5 token match. |
+| hf\_diffusion\_gemma.py | diffusion\_gemma | 1 | google/diffusiongemma-26B-A4B-it. MoE runs on CPU; attention + dense MLP compiled on Spyre. Block-diffusion generate loop. Gated. |
 | hf\_gemma3.py | gemma3\_text / gemma3 (dense) | 2 | Gemma 3 4B/12B/27B (text decoder of the multimodal checkpoints); EmbeddingGemma (bidirectional embedder). Not Gemma 3n (PLE). |
 | hf\_gemma2.py | gemma2 | 1 | Gemma 2 2B and Gemma 2 fine-tunes. |
 | hf\_olmo.py | olmo | 1 | OLMo 7B |
