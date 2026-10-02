@@ -30,6 +30,7 @@ from hf_adapters.hf_common import (
     embed_text_tokens,
     get_backbone,
     kv_cache_update,
+    last_rows,
     prepare_lm_head_for_spyre,
     run_lm_head,
 )
@@ -120,6 +121,8 @@ def _run_backbone_forward(
     key_caches,
     value_caches,
     cache_index,
+    *,
+    rows_to_keep=0,
 ):
     backbone = get_backbone(model)
     cfg = model.config
@@ -164,7 +167,7 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    return backbone.norm(h)
+    return backbone.norm(last_rows(h, rows_to_keep))
 
 
 def _run_forward(

@@ -60,6 +60,7 @@ from hf_adapters.hf_common import (
     apply_rope_matmul,
     get_backbone,
     kv_cache_update,
+    last_rows,
     pad_qk_proj_for_rope,
     permute_proj_for_rope,
     prepare_lm_head_for_spyre,
@@ -194,6 +195,8 @@ def _run_backbone_forward(
     key_caches,
     value_caches,
     cache_index,
+    *,
+    rows_to_keep=0,
 ):
     """GPT-NeoX backbone: token embedding, RoPE, compiled blocks, final_layer_norm."""
     bb = get_backbone(model)
@@ -210,7 +213,7 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    h = bb.final_layer_norm(h)
+    h = bb.final_layer_norm(last_rows(h, rows_to_keep))
     return h
 
 

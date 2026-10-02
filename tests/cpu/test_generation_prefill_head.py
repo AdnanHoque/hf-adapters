@@ -217,6 +217,8 @@ def test_registered_decoders_use_prefill_backbone(monkeypatch, adapter_name):
     else:
         backbone = adapter._run_backbone_forward
         inspect.signature(backbone).bind(*([None] * 7))
+        # generate() asks the prefill backbone for the projected row only.
+        inspect.signature(backbone).bind(*([None] * 7), rows_to_keep=1)
         expected = object()
 
         def generate(forward, actual_model, input_ids, **kwargs):
