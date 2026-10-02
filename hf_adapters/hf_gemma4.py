@@ -102,6 +102,8 @@ from hf_adapters.hf_common import (
     kv_cache_update,
     optional_spyre_config_patch,
     prepare_lm_head_for_spyre,
+    row_selecting_norm,
+    run_final_norm,
     run_lm_head,
     text_config,
 )
@@ -177,7 +179,11 @@ def _gemma4_rms_norm(hidden_states, weight, eps):
     return normed if weight is None else normed * weight
 
 
-_compiled_gemma4_rms_norm = torch.compile(_gemma4_rms_norm, dynamic=False)
+# ``rows_to_keep`` (default 0, every row) lets the final norm select the rows
+# the LM head projects inside this graph (``row_selecting_norm``).
+_compiled_gemma4_rms_norm = torch.compile(
+    row_selecting_norm(_gemma4_rms_norm), dynamic=False
+)
 
 
 def _compute_per_layer_inputs(model, inputs_embeds, input_ids):
@@ -973,13 +979,15 @@ def _run_blocks_over_embeds(
     masks=None,
     per_layer_inputs=None,
     query_row_mask=None,
+    rows_to_keep=0,
 ):
     """Run the compiled Gemma 4 decoder blocks over precomputed embeddings.
 
     Shared by the text-only causal LM (``_run_backbone_forward``) and the VLM
     adapter (``hf_gemma4_mm``, which drives the decoder from image-scattered
     ``inputs_embeds``). Builds per-type RoPE freqs, then runs the blocks under a
-    per-layer-type mask dict and applies the final norm.
+    per-layer-type mask dict and applies the final norm (to the trailing
+    ``rows_to_keep`` rows only when > 0).
 
     ``masks`` (optional ``{layer_type: mask}``) lets a caller supply its own
     per-type masks — the VLM passes masks with the bidirectional vision overlay
@@ -1172,7 +1180,9 @@ def _run_blocks_over_embeds(
 
     norm = backbone.norm
     weight = norm.weight if norm.with_scale else None
-    h = _compiled_gemma4_rms_norm(h, weight, norm.eps)
+    h = run_final_norm(
+        _compiled_gemma4_rms_norm, h, weight, norm.eps, rows_to_keep=rows_to_keep
+    )
     return h
 
 
@@ -1184,6 +1194,8 @@ def _run_backbone_forward(
     key_caches,
     value_caches,
     cache_index,
+    *,
+    rows_to_keep=0,
 ):
     """Gemma 4 backbone: scaled embedding, per-type RoPE + masks, blocks, norm.
 
@@ -1211,6 +1223,7 @@ def _run_backbone_forward(
         cache_index,
         per_layer_inputs=per_layer_inputs,
         query_row_mask=query_row_mask,
+        rows_to_keep=rows_to_keep,
     )
 
 

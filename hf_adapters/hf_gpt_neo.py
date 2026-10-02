@@ -66,6 +66,7 @@ Usage::
 from hf_adapters.hf_common import (
     BLOCK_SIZE,
     get_backbone,
+    last_rows,
     make_decoder_block,
     pad_attention_heads_linear,
     patch_new_gelu,
@@ -118,6 +119,8 @@ def _run_backbone_forward(
     key_caches,
     value_caches,
     cache_index,
+    *,
+    rows_to_keep=0,
 ):
     """GPT-Neo backbone: token + learned position embeddings, compiled blocks, ln_f."""
     bb = get_backbone(model)
@@ -133,7 +136,7 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    h = bb.ln_f(h)
+    h = bb.ln_f(last_rows(h, rows_to_keep))
     return h
 
 
