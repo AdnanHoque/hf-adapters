@@ -21,6 +21,7 @@ Per-model adapters import from this module and provide only model-specific
 compiled block functions.
 """
 
+import inspect
 import math
 import os
 import sys
@@ -1328,6 +1329,9 @@ def row_selecting_norm(norm):
     def final_norm(hidden_states, *args, rows_to_keep: int = 0):
         return norm(last_rows(hidden_states, rows_to_keep), *args)
 
+    # torch.compile preserves a function's attributes. Only this wrapper
+    # promises to select rows inside the norm's compiled graph.
+    setattr(final_norm, "_spyre_selects_rows", True)
     return final_norm
 
 
@@ -1336,12 +1340,33 @@ def run_final_norm(norm, hidden_states, *args, rows_to_keep: int = 0):
 
     ``rows_to_keep=0`` calls ``norm(hidden_states, *args)`` exactly as before, so
     decode, full-position and embedding callers (and any final-norm callable)
-    are unchanged. ``rows_to_keep`` > 0 needs ``norm`` compiled from
-    :func:`row_selecting_norm`, which selects the rows inside its graph.
+    are unchanged. A norm compiled from :func:`row_selecting_norm` selects
+    rows inside its graph. Legacy/custom norms are called without a new keyword,
+    then the kept rows are copied into fresh storage.
     """
     if rows_to_keep:
-        return norm(hidden_states, *args, rows_to_keep=rows_to_keep)
+        if getattr(norm, "_spyre_selects_rows", False):
+            return norm(hidden_states, *args, rows_to_keep=rows_to_keep)
+        # contiguous() can retain a batch-1 view with a nonzero storage offset.
+        return last_rows(norm(hidden_states, *args), rows_to_keep).clone()
     return norm(hidden_states, *args)
+
+
+def _accepts_row_request(backbone):
+    """Only explicitly declared row keywords opt a backbone into row selection.
+
+    A legacy callback's **kwargs may be forwarded to another callable, so its
+    presence alone does not establish support. Uninspectable callbacks retain
+    the original full-row call contract.
+    """
+    try:
+        parameter = inspect.signature(backbone).parameters.get("rows_to_keep")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def chunk_lm_head(model, num_chunks=8):
@@ -2735,12 +2760,14 @@ def generate(
         timing: Print per-token latency.
         prefill_backbone_fn: Optional adapter backbone with the same arguments
             as ``run_forward_fn``, returning hidden states. Text prefill runs
-            this for every chunk with ``rows_to_keep=1``, then applies the
-            prepared LM head only to the last token. The backbone returns only
-            that row, selected inside its final norm (:func:`last_rows`,
+            this for every chunk, then applies the prepared LM head only to the
+            last token. A backbone explicitly declaring ``rows_to_keep`` is
+            called with ``rows_to_keep=1`` and returns only that row, selected
+            inside its final norm (:func:`last_rows`,
             :func:`row_selecting_norm`, :func:`run_final_norm`), so the head
-            reads its own one-row buffer, as in decode. Custom ``prefill_fn``
-            hooks take precedence.
+            reads its own one-row buffer, as in decode. Legacy callbacks receive
+            no new keyword and can return every row. Custom ``prefill_fn`` hooks
+            take precedence.
         prefill_chunk_size (via generation_config or kwargs): Query length for
             each prefill chunk when the adapter does not configure one. An
             adapter-configured chunk size takes precedence; an explicit caller
@@ -2949,7 +2976,10 @@ def generate(
                 # The head below projects one row, so a prefill backbone
                 # normalizes only that row (into its own buffer).
                 backbone_rows = (
-                    {"rows_to_keep": 1} if prefill_backbone_fn is not None else {}
+                    {"rows_to_keep": 1}
+                    if prefill_backbone_fn is not None
+                    and _accepts_row_request(prefill_backbone_fn)
+                    else {}
                 )
                 for chunk_start in range(0, padded_len, query_chunk_size):
                     chunk_end = chunk_start + query_chunk_size

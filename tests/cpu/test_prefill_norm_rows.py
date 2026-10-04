@@ -24,6 +24,33 @@ _HIDDEN = 128
 _VOCAB = 129
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("wrapped", [False, True])
+@torch.no_grad()
+def test_row_request_with_real_compiled_norm(batch_size, wrapped):
+    """Both legacy and row-selecting norms execute real full-graph AOT compile."""
+    from torch._dynamo.backends.registry import lookup_backend
+
+    torch.manual_seed(23)
+    norm = torch.nn.RMSNorm(64, eps=1e-5).eval()
+    h = torch.randn(batch_size, 8, 64)
+    expected = norm(h)[:, -1:, :]
+    graphs = []
+
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return lookup_backend("aot_eager")(graph, inputs)
+
+    fn = hf_common.row_selecting_norm(norm) if wrapped else norm
+    compiled = torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
+    actual = hf_common.run_final_norm(compiled, h, rows_to_keep=1)
+    assert graphs  # No compile identity mock in this regression.
+    assert actual.shape == (batch_size, 1, 64)
+    assert actual.storage_offset() == 0 and actual.is_contiguous()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(hf_common.run_final_norm(compiled, h), norm(h))
+
+
 def _load_through_auto_class(monkeypatch, adapter, model):
     monkeypatch.setattr(
         auto_spyre_model, "resolve_adapter_module", lambda *args, **kwargs: adapter
