@@ -43,12 +43,16 @@ def test_row_request_with_real_compiled_norm(batch_size, wrapped):
 
     fn = hf_common.row_selecting_norm(norm) if wrapped else norm
     compiled = torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
+    assert getattr(compiled, "_spyre_selects_rows", False) is wrapped
     actual = hf_common.run_final_norm(compiled, h, rows_to_keep=1)
     assert graphs  # No compile identity mock in this regression.
     assert actual.shape == (batch_size, 1, 64)
     assert actual.storage_offset() == 0 and actual.is_contiguous()
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(hf_common.run_final_norm(compiled, h), norm(h))
+    # The wrapped path specializes a one-row graph and a full-row graph. A
+    # silently lost capability would use the same full-row graph for both.
+    assert len(graphs) == (2 if wrapped else 1)
 
 
 def _load_through_auto_class(monkeypatch, adapter, model):
