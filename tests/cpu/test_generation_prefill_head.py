@@ -152,6 +152,50 @@ def test_prefill_head_matches_full_logits(prepared_model, chunk_size, batch_size
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("forwards_kwargs", [False, True])
+def test_legacy_prefill_backbone_matches_full_logits(prepared_model, forwards_kwargs):
+    """Legacy callbacks need no new keyword, even when forwarding **kwargs."""
+    model, adapter = prepared_model
+    model._spyre_prefill_chunk_size = 64
+    ids = torch.randint(1, 129, (2, 139))
+    mask = torch.ones_like(ids)
+    mask[0, 71:] = 0
+    ids[0, 71:] = 0
+    options = dict(
+        attention_mask=mask,
+        max_new_tokens=3,
+        do_sample=False,
+        eos_token_id=None,
+        return_dict_in_generate=True,
+        output_logits=True,
+    )
+    expected = hf_common.generate(adapter._run_forward, model, ids, **options)
+    calls = []
+
+    def legacy(model, ids, positions, mask, keys, values, cache_index):
+        calls.append(ids.shape[1])
+        return adapter._run_backbone_forward(
+            model, ids, positions, mask, keys, values, cache_index
+        )
+
+    def forwarding(model, ids, positions, mask, keys, values, cache_index, **kwargs):
+        assert kwargs == {}
+        return legacy(model, ids, positions, mask, keys, values, cache_index, **kwargs)
+
+    actual = hf_common.generate(
+        adapter._run_forward,
+        model,
+        ids,
+        prefill_backbone_fn=forwarding if forwards_kwargs else legacy,
+        **options,
+    )
+    assert calls == [64, 64, 64]
+    torch.testing.assert_close(actual.sequences, expected.sequences)
+    for got, want in zip(actual.logits, expected.logits, strict=True):
+        torch.testing.assert_close(got, want)
+
+
+@torch.no_grad()
 def test_custom_prefill_hook_takes_precedence(prepared_model):
     model, adapter = prepared_model
     ids = torch.tensor([[11, 12, 13]])
