@@ -102,7 +102,6 @@ from hf_adapters.hf_common import (
     kv_cache_update,
     optional_spyre_config_patch,
     prepare_lm_head_for_spyre,
-    row_selecting_norm,
     run_final_norm,
     run_lm_head,
     text_config,
@@ -179,11 +178,9 @@ def _gemma4_rms_norm(hidden_states, weight, eps):
     return normed if weight is None else normed * weight
 
 
-# ``rows_to_keep`` (default 0, every row) lets the final norm select the rows
-# the LM head projects inside this graph (``row_selecting_norm``).
-_compiled_gemma4_rms_norm = torch.compile(
-    row_selecting_norm(_gemma4_rms_norm), dynamic=False
-)
+# Keep the full-row norm graph: its sliced FP32 conversion has no Spyre layout.
+# run_final_norm copies the requested rows from this legacy norm's output.
+_compiled_gemma4_rms_norm = torch.compile(_gemma4_rms_norm, dynamic=False)
 
 
 def _compute_per_layer_inputs(model, inputs_embeds, input_ids):
