@@ -1,11 +1,12 @@
 # Copyright 2026 The Torch-Spyre Authors.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generation prefill normalizes and projects only the final prompt row.
+"""Generation prefill projects only the final prompt row.
 
 ``hf_common.generate`` asks every adapter's prefill backbone for one row
-(``rows_to_keep=1``); the backbone selects it inside its final norm, so the LM
-head gets its own ``[B, 1, H]`` buffer, the same input as in a decode step. The
+(``rows_to_keep=1``); supported norms select it inside their graph, while legacy
+norms normalize all rows and copy the kept row. The LM head gets its own
+``[B, 1, H]`` buffer, the same input as in a decode step. The
 image-text-to-text prefills (``_prefill_forward(logits_to_keep=1)``) ask their
 text backbones the same way.
 """
@@ -183,12 +184,11 @@ def _spy_gemma4_norm(monkeypatch, model, rows):
         rows.append(hidden_states.shape[1])
         return hf_gemma4._gemma4_rms_norm(hidden_states, weight, eps)
 
-    # The production object is torch.compile(row_selecting_norm(_gemma4_rms_norm));
-    # rebuild it uncompiled around a recording norm.
+    # Preserve the bare production norm's full-row fallback contract.
     monkeypatch.setattr(
         hf_gemma4,
         "_compiled_gemma4_rms_norm",
-        hf_common.row_selecting_norm(recording_rms_norm),
+        recording_rms_norm,
     )
 
 
@@ -329,11 +329,12 @@ _FAMILIES = {
 
 @pytest.mark.parametrize("adapter_name", sorted(_FAMILIES))
 @torch.no_grad()
-def test_prefill_backbone_normalizes_only_the_projected_row(monkeypatch, adapter_name):
+def test_prefill_backbone_returns_the_projected_row(monkeypatch, adapter_name):
     """Each family's prefill backbone returns the last row from its final norm.
 
-    Each prefill chunk normalizes one row, the LM head reads that row as its
-    own buffer (storage offset 0), and tokens and logits equal the
+    GPT-2 and Gemma4 retain their full-row norm graph; other families normalize
+    only the requested row. The LM head reads that row as its own buffer
+    (storage offset 0), and tokens and logits equal the
     full-position forward's, at batch 1 and for mixed-length batch-2 prompts.
     """
     make_config, norm_spy = _FAMILIES[adapter_name]
@@ -379,8 +380,14 @@ def test_prefill_backbone_normalizes_only_the_projected_row(monkeypatch, adapter
         norm_rows.clear()
         head_inputs.clear()
         actual = model.generate(ids, **options)
-        # Three 64-position prefill chunks of one row each, then two decode steps.
-        assert norm_rows == [1, 1, 1, 1, 1]
+        # Three prefill chunks, then two decode steps. Legacy norms keep the
+        # full-row graph, with selection/copy afterward in run_final_norm.
+        expected_norm_rows = (
+            [64, 64, 64, 1, 1]
+            if adapter_name in ("hf_gpt2", "hf_gemma4")
+            else [1, 1, 1, 1, 1]
+        )
+        assert norm_rows == expected_norm_rows
         assert head_inputs == [((batch_size, 1, hidden_size), 0)] * 3
         torch.testing.assert_close(actual.sequences, full.sequences)
         for got, want in zip(actual.logits, full.logits, strict=True):
