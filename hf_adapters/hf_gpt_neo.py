@@ -66,11 +66,11 @@ Usage::
 from hf_adapters.hf_common import (
     BLOCK_SIZE,
     get_backbone,
-    last_rows,
     make_decoder_block,
     pad_attention_heads_linear,
     patch_new_gelu,
     prepare_lm_head_for_spyre,
+    run_final_norm,
     run_lm_head,
 )
 
@@ -136,7 +136,7 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    h = bb.ln_f(last_rows(h, rows_to_keep))
+    h = run_final_norm(bb.ln_f, h, rows_to_keep=rows_to_keep)
     return h
 
 

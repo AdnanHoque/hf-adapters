@@ -24,6 +24,7 @@ from hf_adapters.hf_common import (
     pad_attention_heads_linear,
     patch_new_gelu,
     prepare_lm_head_for_spyre,
+    run_final_norm,
     run_lm_head,
 )
 
@@ -75,10 +76,11 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    # The final norm and projection act per position: keep only the rows asked for.
-    h = last_rows(h, rows_to_keep)
+    # Normalize the full buffer before selecting a row for the final projection.
     if decoder.final_layer_norm is not None:
-        h = decoder.final_layer_norm(h)
+        h = run_final_norm(decoder.final_layer_norm, h, rows_to_keep=rows_to_keep)
+    else:
+        h = last_rows(h, rows_to_keep)
     if decoder.project_out is not None:
         h = decoder.project_out(h)
     return h
