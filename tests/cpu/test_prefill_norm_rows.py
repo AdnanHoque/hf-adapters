@@ -332,8 +332,8 @@ _FAMILIES = {
 def test_prefill_backbone_returns_the_projected_row(monkeypatch, adapter_name):
     """Each family's prefill backbone returns the last row from its final norm.
 
-    GPT-2 and Gemma4 retain their full-row norm graph; other families normalize
-    only the requested row. The LM head reads that row as its own buffer
+    LayerNorm families and Gemma4 retain their full-row norm graph; other
+    families normalize only the requested row. The LM head reads its own buffer
     (storage offset 0), and tokens and logits equal the
     full-position forward's, at batch 1 and for mixed-length batch-2 prompts.
     """
@@ -384,7 +384,15 @@ def test_prefill_backbone_returns_the_projected_row(monkeypatch, adapter_name):
         # full-row graph, with selection/copy afterward in run_final_norm.
         expected_norm_rows = (
             [64, 64, 64, 1, 1]
-            if adapter_name in ("hf_gpt2", "hf_gemma4")
+            if adapter_name
+            in (
+                "hf_gpt2",
+                "hf_gpt_neo",
+                "hf_gpt_neox",
+                "hf_opt",
+                "hf_olmo",
+                "hf_gemma4",
+            )
             else [1, 1, 1, 1, 1]
         )
         assert norm_rows == expected_norm_rows
