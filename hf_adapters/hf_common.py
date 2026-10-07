@@ -1355,23 +1355,6 @@ def run_final_norm(norm, hidden_states, *args, rows_to_keep: int = 0):
     return norm(hidden_states, *args)
 
 
-def _accepts_row_request(backbone):
-    """Only explicitly declared row keywords opt a backbone into row selection.
-
-    A legacy callback's **kwargs may be forwarded to another callable, so its
-    presence alone does not establish support. Uninspectable callbacks retain
-    the original full-row call contract.
-    """
-    try:
-        parameter = inspect.signature(backbone).parameters.get("rows_to_keep")
-    except (TypeError, ValueError):
-        return False
-    return parameter is not None and parameter.kind in (
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
-    )
-
-
 def chunk_lm_head(model, num_chunks=8):
     """Split the LM head weight into N stick-padded chunks along the vocab dim.
 
@@ -2893,13 +2876,12 @@ def generate(
         prefill_backbone_fn: Optional adapter backbone with the same arguments
             as ``run_forward_fn``, returning hidden states. Text prefill runs
             this for every chunk, then applies the prepared LM head only to the
-            last token. A backbone explicitly declaring ``rows_to_keep`` is
-            called with ``rows_to_keep=1`` and returns only that row, selected
-            inside its final norm (:func:`last_rows`,
-            :func:`row_selecting_norm`, :func:`run_final_norm`), so the head
-            reads its own one-row buffer, as in decode. Legacy callbacks receive
-            no new keyword and can return every row. Custom ``prefill_fn`` hooks
-            take precedence.
+            last token. Every supplied backbone must accept ``rows_to_keep=1``
+            and return hidden states shaped ``[B, 1, H]``. Adapters select the
+            row through :func:`last_rows` or :func:`run_final_norm`; supported
+            norms use :func:`row_selecting_norm` to select inside their compiled
+            graph. Unsupported callbacks fail without a fallback or retry of
+            KV-cache updates. Custom ``prefill_fn`` hooks take precedence.
         prefill_chunk_size (via generation_config or kwargs): Query length for
             each prefill chunk when the adapter does not configure one. An
             adapter-configured chunk size takes precedence; an explicit caller
@@ -3108,10 +3090,7 @@ def generate(
                 # The head below projects one row, so a prefill backbone
                 # normalizes only that row (into its own buffer).
                 backbone_rows = (
-                    {"rows_to_keep": 1}
-                    if prefill_backbone_fn is not None
-                    and _accepts_row_request(prefill_backbone_fn)
-                    else {}
+                    {"rows_to_keep": 1} if prefill_backbone_fn is not None else {}
                 )
                 for chunk_start in range(0, padded_len, query_chunk_size):
                     chunk_end = chunk_start + query_chunk_size
@@ -3128,6 +3107,13 @@ def generate(
                         ),
                         **backbone_rows,
                     )
+                    if prefill_backbone_fn is not None and (
+                        prefill_output.ndim != 3 or prefill_output.shape[1] != 1
+                    ):
+                        raise ValueError(
+                            "prefill_backbone_fn must return [B, 1, H] hidden states "
+                            "when called with rows_to_keep=1"
+                        )
                 # Every chunk must populate KV, but only the final prompt
                 # token needs a vocabulary projection for generation.
                 logits = (
