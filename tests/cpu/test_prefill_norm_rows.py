@@ -489,7 +489,7 @@ def test_multimodal_prefill_asks_the_backbone_for_the_projected_row(
         monkeypatch.setattr(adapter.hf_gemma4, "_run_blocks_over_embeds", backbone)
         kwargs.update(image_position_ids=None, mm_token_type_ids=torch.zeros_like(ids))
     else:
-        monkeypatch.setattr(adapter, "_embed_text", lambda *args: hidden)
+        monkeypatch.setattr(adapter, "embed_text_tokens", lambda *args: hidden)
         mask_shape = (
             (batch_size, 8, 1)
             if adapter.__name__.endswith("hf_granite_vision_mm")
