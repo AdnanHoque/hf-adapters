@@ -507,7 +507,7 @@ modification:
 | Logits scaling | Yes | Yes | No | Yes | Yes | No | No | No | No | No | No | No | No | No |
 | Q/K RMSNorm | No | No | Yes (per-head) | No | No | No | No | No | No | No | No | Yes (flattened) | Yes (per-head Q/K) | Yes (per-head Q/K/V) |
 | Fused QKV split | No | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
-| Q/K/V fused at prepare time (when accepted) | Yes | Yes | No | No | Full-attention layers | No | Yes | Yes | Yes | No | Yes | No | No | No |
+| Q/K/V fusion with `SPYRE_FUSE_QKV=1` (when accepted) | Yes | Yes | No | No | Full-attention layers | No | Yes | Yes | Yes | No | Yes | No | No | No |
 | Fused MLP split | No | No | No | Yes | No | No | No | No | No | Yes | No | No | No | No |
 | NoPE layers | No | No | No | No | No | Yes | No | No | No | No | No | No | No | No |
 | Partial RoPE | No | No | No | No | No | No | No | No | No | Yes | No | No | No | Yes (global layers) |
@@ -532,18 +532,17 @@ verified on Spyre) fits a single smooth-padded head via `pad_lm_head()`
 cost of chunking. Kept as the escape hatch for future models.
 
 **Fused weight split** (Phi-4, Granite 4.0): QKV/gate_up_proj split
-into separate linears at prepare time. The original reason was stickify
-assertions on non-zero offsets. In current torch-spyre only a slice that
-starts inside a stick has such an offset (see Fused Q/K/V projection
-below), and the Phi-4 and Granite 4.0 split points are whole sticks, so
-for them the reason may be stale. Phi-4 still needs separate Q and K to
-permute and pad them per projection for partial RoPE. Revisiting these
-splits is separate work.
+into separate linears at prepare time. Phi-4 needs separate Q and K to
+permute and pad them per projection for partial RoPE.
 
 **Fused Q/K/V projection** (every adapter on `StandardGQABlock`):
-Q, K and V read the same normalized input, so `StandardGQAAttention`
-stacks plain `q_proj`/`k_proj`/`v_proj` linears into one `qkv_proj` at
-prepare time (`fuse_linears`, the inverse of `split_fused_linear`, run
+Fusion is off by default. Set `SPYRE_FUSE_QKV` to the literal value `1`
+before preparing the model
+to opt in; performance has not been isolated across prefill, decode and TP
+configurations. Q, K and V read the same normalized input, so when enabled
+`StandardGQAAttention` stacks plain `q_proj`/`k_proj`/`v_proj` linears into
+one `qkv_proj` at prepare time (`fuse_linears`, the inverse of
+`split_fused_linear`, run
 after TP sharding and head padding) and splits its output into Q, K and
 V views. One matmul then reads the input once instead of three times;
 each output column is the same dot product.
@@ -552,9 +551,7 @@ each output column is the same dot product.
   (`BLOCK_SIZE`). A part that starts on a stick boundary keeps an
   offset-free in-stick index (`Mod(i, 64)`, the form torch-spyre's
   `is_stick_expr_offset_free` accepts), so it stays a view and needs no
-  ReStickify; a split inside a stick would need one. Historical Granite 3.3 8B compilation reports (TP4 and TP1) showed
-  no added copy or ReStickify at the split. Those reports do not qualify
-  every adapter or newer compiler version.
+  ReStickify; a split inside a stick would need one.
 - *Hooks.* The fused layer is a new module, so it runs none of its
   sources' hooks. `fuse_linears` fuses only when every source hook is
   known to do nothing going forward and Q, K and V carry the same hooks.
@@ -570,6 +567,15 @@ each output column is the same dot product.
   `dim_order=[1, 0]` Linear layout, so the block that owns it must be
   registered in the model (`make_standard_gqa_block`). KV-cache sizing
   reads the rank-local K width from `qkv_sizes`.
+- *Prepared-model keys.* With fusion enabled and accepted, `state_dict()`
+  replaces `self_attn.{q,k,v}_proj.{weight,bias}` with
+  `self_attn.qkv_proj.{weight,bias}` (bias keys exist only for biased layers).
+  The default separate path keeps the original projection keys. Saving or
+  inspecting a prepared model must account for this distinction; loading a
+  fused prepared checkpoint into an unprepared model is not supported here.
+  `utils/module_discovery/auto_generate_module_config.py` emits
+  `StandardGQAAttention` entries. Use the same fusion setting when generating
+  and running configs so their prepared projection form is consistent.
 
 **Head-dim padding** (Granite 2B, TinyLlama, Granite Vision, Granite 4.0 Micro): `pad_attention_heads()`
 zero-pads Q/K/V/O projections and RoPE freqs from 64→128 so

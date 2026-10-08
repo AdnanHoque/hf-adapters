@@ -327,24 +327,33 @@ _FAMILIES = {
 }
 
 
-@pytest.mark.parametrize("adapter_name", sorted(_FAMILIES))
+@pytest.mark.parametrize(
+    "adapter_name,dtype",
+    [(name, torch.float32) for name in sorted(_FAMILIES)]
+    + [
+        (name, dtype)
+        for name in ("hf_gemma2", "hf_gemma3")
+        for dtype in (torch.float16, torch.bfloat16)
+    ],
+)
 @torch.no_grad()
-def test_prefill_backbone_returns_the_projected_row(monkeypatch, adapter_name):
+def test_prefill_backbone_returns_the_projected_row(monkeypatch, adapter_name, dtype):
     """Each family's prefill backbone returns the last row from its final norm.
 
-    LayerNorm families and Gemma4 retain their full-row norm graph; other
+    LayerNorm families and Gemma 2/3/4 retain their full-row norm; other
     families normalize only the requested row. The LM head reads its own buffer
     (storage offset 0), and tokens and logits equal the
     full-position forward's, at batch 1 and for mixed-length batch-2 prompts.
+    FP16/BF16 cases check the CPU row/buffer contract, not the Spyre norm branch.
     """
     make_config, norm_spy = _FAMILIES[adapter_name]
     monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
     adapter = importlib.import_module(f"hf_adapters.{adapter_name}")
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(17)
-        model = AutoModelForCausalLM.from_config(make_config()).eval()
+        model = AutoModelForCausalLM.from_config(make_config()).eval().to(dtype)
     adapter.prepare_for_spyre(model)
-    hf_common.set_rope_dtype(model, torch.float32)
+    hf_common.set_rope_dtype(model, dtype)
     model._spyre_prefill_chunk_size = 64
     model = _load_through_auto_class(monkeypatch, adapter, model)
 
@@ -391,6 +400,8 @@ def test_prefill_backbone_returns_the_projected_row(monkeypatch, adapter_name):
                 "hf_gpt_neox",
                 "hf_opt",
                 "hf_olmo",
+                "hf_gemma2",
+                "hf_gemma3",
                 "hf_gemma4",
             )
             else [1, 1, 1, 1, 1]

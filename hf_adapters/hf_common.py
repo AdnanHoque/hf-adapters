@@ -1327,6 +1327,8 @@ def row_selecting_norm(norm):
     norm output instead, the batch-1 row is a view at a storage offset, and
     Torch-Spyre keeps a matmul that reads an offset slice on its fixed work
     division, so the LM head would not get the decode head's plan.
+    With ``dynamic=False``, each distinct Python ``rows_to_keep`` value
+    specializes a separate graph, including values forwarded by VLM callers.
     """
 
     def final_norm(hidden_states, *args, rows_to_keep: int = 0):
@@ -1346,6 +1348,8 @@ def run_final_norm(norm, hidden_states, *args, rows_to_keep: int = 0):
     are unchanged. A norm compiled from :func:`row_selecting_norm` selects
     rows inside its graph. Legacy/custom norms are called without a new keyword,
     then the kept rows are copied into fresh storage.
+    Generation requests one row on every prefill chunk, so legacy norms also
+    copy that row on non-final chunks whose output is subsequently discarded.
     """
     if rows_to_keep:
         if getattr(norm, "_spyre_selects_rows", False):
@@ -1431,6 +1435,9 @@ def _identity_tp_hook_kind(hook) -> Optional[str]:
 
     Returns ``"colwise input"`` or ``"colwise output"`` for those two hooks,
     and ``None`` for any other hook, including a gathering output hook.
+    When updating the Transformers pin, run
+    ``test_fused_qkv_drops_only_colwise_hooks_without_forward_effect[transformers]``
+    in ``tests/cpu/test_standard_gqa_fused_qkv.py`` to check this hook contract.
     """
     if not inspect.isfunction(hook) or (hook.__module__, hook.__qualname__) != (
         "transformers.integrations.tensor_parallel",
@@ -3254,7 +3261,8 @@ def generate(
 class StandardGQAAttention(nn.Module):
     """Standard GQA attention split into projection and attention regions.
 
-    Q, K and V project the same input. When ``fuse_linears`` accepts them,
+    Q, K and V project the same input. With ``SPYRE_FUSE_QKV=1`` set before
+    preparation, when ``fuse_linears`` accepts them,
     they run as one ``qkv_proj`` matmul, built here from the projections as
     loading left them (rank-local TP shards, padded heads), and ``pre_attn``
     splits its output into Q, K and V views. Otherwise they run separately.
@@ -3263,7 +3271,11 @@ class StandardGQAAttention(nn.Module):
     def __init__(self, attn):
         super().__init__()
         projections = (attn.q_proj, attn.k_proj, attn.v_proj)
-        self.qkv_proj = fuse_linears(projections)
+        self.qkv_proj = (
+            fuse_linears(projections)
+            if os.getenv("SPYRE_FUSE_QKV", "0") == "1"
+            else None
+        )
         if self.qkv_proj is None:
             self.q_proj, self.k_proj, self.v_proj = projections
         else:

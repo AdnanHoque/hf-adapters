@@ -75,8 +75,8 @@ from hf_adapters.hf_common import (
     embed_text_tokens,
     get_backbone,
     kv_cache_update,
-    last_rows,
     prepare_lm_head_for_spyre,
+    run_final_norm,
     run_lm_head,
     text_config,
 )
@@ -440,7 +440,7 @@ def _run_backbone_forward(
     if swa_mode == "anchored" and state is not None and seq_len == 1:
         state.advance()
 
-    h = backbone.norm(last_rows(h, rows_to_keep))
+    h = run_final_norm(backbone.norm, h, rows_to_keep=rows_to_keep)
     return h
 
 
