@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The standard GQA block runs Q/K/V as one fused projection.
+"""The standard GQA block fuses Q/K/V when ``SPYRE_FUSE_QKV=1``.
 
 Q, K and V read the same normalized input, so ``StandardGQAAttention`` stacks
 them into one ``qkv_proj`` and splits its output. These tests check that the
@@ -72,6 +72,31 @@ from hf_adapters.spyre_tensor_parallel import (
 )
 
 HIDDEN, HEADS, KV_HEADS, HEAD_DIM = 256, 4, 2, 64
+
+
+@pytest.fixture(autouse=True)
+def _enable_fusion(monkeypatch):
+    """Exercise the opt-in path throughout this fusion-specific suite."""
+    monkeypatch.setenv("SPYRE_FUSE_QKV", "1")
+
+
+@pytest.mark.parametrize("flag", [None, "0"])
+def test_qkv_fusion_is_opt_in(monkeypatch, flag):
+    if flag is None:
+        monkeypatch.delenv("SPYRE_FUSE_QKV")
+    else:
+        monkeypatch.setenv("SPYRE_FUSE_QKV", flag)
+
+    def unexpected_fusion(_projections):
+        pytest.fail("disabled fusion must not construct a fused projection")
+
+    monkeypatch.setattr(hf_common, "fuse_linears", unexpected_fusion)
+    _, layer = _tiny_granite_layer()
+    block = StandardGQABlock(layer, is_res_mul=True)
+    assert block.self_attn.qkv_proj is None
+    for name in ("q_proj", "k_proj", "v_proj"):
+        assert f"self_attn.{name}.weight" in block.state_dict()
+    assert "self_attn.qkv_proj.weight" not in block.state_dict()
 
 
 def _tiny_granite_layer(attention_bias=False):

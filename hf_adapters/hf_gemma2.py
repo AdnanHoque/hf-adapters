@@ -30,8 +30,8 @@ from hf_adapters.hf_common import (
     embed_text_tokens,
     get_backbone,
     kv_cache_update,
-    last_rows,
     prepare_lm_head_for_spyre,
+    run_final_norm,
     run_lm_head,
 )
 from hf_adapters.hf_gemma3 import _patch_gemma_rmsnorm
@@ -167,7 +167,7 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    return backbone.norm(last_rows(h, rows_to_keep))
+    return run_final_norm(backbone.norm, h, rows_to_keep=rows_to_keep)
 
 
 def _run_forward(
