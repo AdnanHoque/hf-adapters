@@ -76,11 +76,11 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    # Normalize the full buffer before selecting a row for the final projection.
+    # Preserve full-row normalization and give the final projection owned rows.
     if decoder.final_layer_norm is not None:
         h = run_final_norm(decoder.final_layer_norm, h, rows_to_keep=rows_to_keep)
-    else:
-        h = last_rows(h, rows_to_keep)
+    elif rows_to_keep:
+        h = last_rows(h, rows_to_keep).clone()
     if decoder.project_out is not None:
         h = decoder.project_out(h)
     return h

@@ -413,6 +413,56 @@ def test_prefill_backbone_returns_the_projected_row(monkeypatch, adapter_name, d
             torch.testing.assert_close(got, want)
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("word_embed_proj_dim", [64, _HIDDEN])
+@torch.no_grad()
+def test_opt_without_final_norm_owns_the_retained_row(
+    monkeypatch, batch_size, word_embed_proj_dim
+):
+    """Post-norm OPT copies the retained row before project_out or the LM head."""
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    adapter = importlib.import_module("hf_adapters.hf_opt")
+    config = _FAMILIES["hf_opt"][0]()
+    config.do_layer_norm_before = False
+    config.word_embed_proj_dim = word_embed_proj_dim
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(17)
+        model = AutoModelForCausalLM.from_config(config).eval()
+    adapter.prepare_for_spyre(model)
+    model._spyre_prefill_chunk_size = 64
+    model = _load_through_auto_class(monkeypatch, adapter, model)
+    decoder = model.model.decoder
+    assert decoder.final_layer_norm is None
+    assert (decoder.project_out is None) == (word_embed_proj_dim == _HIDDEN)
+
+    ids = torch.arange(1, 71).expand(batch_size, -1).clone()
+    options = dict(
+        max_new_tokens=3,
+        do_sample=False,
+        eos_token_id=None,
+        return_dict_in_generate=True,
+        output_logits=True,
+    )
+    full = hf_common.generate(adapter._run_forward, model, ids, **options)
+    projection_inputs = []
+    projection = (
+        decoder.project_out if decoder.project_out is not None else model.lm_head
+    )
+    projection.register_forward_pre_hook(
+        lambda _module, args: projection_inputs.append(
+            (tuple(args[0].shape), args[0].storage_offset(), args[0].is_contiguous())
+        )
+    )
+    actual = model.generate(ids, **options)
+    # project_out runs on both prefill chunks; the LM head runs only after the
+    # last one. Both then run for two decode steps.
+    calls = 4 if decoder.project_out is not None else 3
+    assert projection_inputs == [((batch_size, 1, _HIDDEN), 0, True)] * calls
+    torch.testing.assert_close(actual.sequences, full.sequences)
+    for got, want in zip(actual.logits, full.logits, strict=True):
+        torch.testing.assert_close(got, want)
+
+
 @pytest.mark.parametrize(
     "adapter_name", ["hf_granite", "hf_lfm2", "hf_llama", "hf_phi3"]
 )
