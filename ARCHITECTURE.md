@@ -91,6 +91,15 @@ unnormalized selected probabilities. Prefill evaluates all experts persistently;
 decode gathers only the selected experts. The BF16 path compiles and runs
 end-to-end with 5/5 top-1 agreement against the CPU reference.
 
+### Speculative-decoding drafter (block-propose)
+
+| Model | model\_type | Target | head\_dim | D/2 | Stick Aligned | Oracle Accurate | Spyre Compiles | Spyre Runs |
+|-------|-----------|--------|---------|-----|--------------|----------------|---------------|-----------|
+| XPress Gemma 4 26B-A4B b16 (`UIUC-SSAIL/gemma4-26b-a4b-XPress-b16`) | qwen3 (`Qwen3XPressModel`) | Gemma 4 26B-A4B | 128 | 64 | Yes | Yes | Yes | Yes |
+
+**Oracle Accurate** = `propose_block` matches a plain-PyTorch transcription of the speculators training code on CPU (`tests/cpu/test_xpress_cpu.py`; a drafter has no stock-HF `generate` to compare against).
+**Spyre Runs** = `tests/spyre/test_xpress_draft_spyre.py` holds block-hidden and base-logit cosine ≥ 0.99 against the fp32 oracle on the real checkpoint (bf16: 0.9998 / 0.9999).
+
 ### Vision-Language (image→text)
 
 Full multimodal VLMs: a vision tower (image → patch features) plus a causal text
@@ -201,12 +210,13 @@ all pass that check.
 > adapter or verify a checkpoint, update *only* this file (and the badge
 > counts in README.md, noted below).
 
-**Coverage:** 39 adapters · 62 verified checkpoints · 10K+ compatible models.
-The 62 verified rows are 39 generative + 13 embedding + 2 seq-classification +
-2 token-classification + 6 vision-language (see the Verified Checkpoints tables
-above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components
+**Coverage:** 40 adapters · 63 verified checkpoints · 10K+ compatible models.
+The 63 verified rows are 39 generative + 13 embedding + 2 seq-classification +
+2 token-classification + 6 vision-language + 1 speculative-decoding drafter (see
+the Verified Checkpoints tables above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components
 used by VLM adapters and are not included in the adapter count. The three DSpark
-speculative-decoding drafter adapters are included in the adapter count.
+speculative-decoding drafter adapters and the XPress drafter adapter are included
+in the adapter count.
 Granite Vision 4.1 is verified both as a text backbone (generative) and as a full VLM.
 `hf_mistral3_vision_mm` covers both the ``mistral`` text-backbone variant
 (Mistral-Small-3.1/3.2) and the ``ministral3`` variant (Ministral-3-14B-Instruct-2512,
@@ -240,6 +250,7 @@ pattern, norms, and weight layout.
 | hf\_gemma4.py | gemma4\_unified / gemma4 (dense + PLE/KV-share) | 4 | Gemma 4 31B (dense). Not 26B-A4B (MoE). |
 | hf\_gemma4\_mm.py | gemma4\_unified / gemma4 (multimodal) | 4 | Encoder-free dense unified VLMs plus full-vision PLE/KV-share and MoE variants. Combined MoE+PLE/KV-share remains unsupported. |
 | hf\_gemma4\_moe.py | gemma4 (MoE, `enable_moe_block`) | 1 | Gemma 4 26B-A4B (128 experts, top-8 routing). Persistent prefill + shared-storage four-chunk gathered decode. |
+| hf\_xpress\_qwen3.py | qwen3 (`Qwen3XPressModel` drafter) | 1 | XPress speculative-decoding drafter: DFlash block backbone (Qwen3-style layers, mixed sliding/full) + causal refiner, block 16, K=6 Jacobi passes, top-C=512. Vocab weights from the target. UIUC-SSAIL/gemma4-26b-a4b-XPress-b16 (Gemma 4 26B-A4B target); same adapter should load UIUC-SSAIL/Qwen3-8B-XPress-b16. Block-propose API (`propose_block`). Spyre (bf16) vs fp32 speculators-math oracle: block-hidden cos 0.9998, base-logit cos 0.9999; ~50 ms per 15-token proposal at top-C=512. |
 | hf\_diffusion\_gemma.py | diffusion\_gemma | 1 | google/diffusiongemma-26B-A4B-it. MoE runs on CPU; attention + dense MLP compiled on Spyre. Block-diffusion generate loop. Gated. |
 | hf\_gemma3.py | gemma3\_text / gemma3 (dense) | 2 | Gemma 3 4B/12B/27B (text decoder of the multimodal checkpoints); EmbeddingGemma (bidirectional embedder). Not Gemma 3n (PLE). |
 | hf\_gemma2.py | gemma2 | 1 | Gemma 2 2B and Gemma 2 fine-tunes. |
