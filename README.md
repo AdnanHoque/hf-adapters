@@ -396,12 +396,32 @@ Apache 2.0
 ### Granite TP4 prefill work split (opt-in)
 
 Set `SPYRE_GRANITE_TP4_PREFILL_MLP=1` on **every rank before loading the model**
-to use the checked MLP work split for Granite 3.3 8B, TP4, FP16, batch 1,
-512-token prefill. Gate, activation, up and product use eight row groups and
+to use the experimental MLP work split for Granite 3.3 8B, TP4, FP16, batch 1.
+Gate, activation, up and product use eight row groups and
 four column groups. Down uses the same split with the original 3200 input
 channels; storage stays 3328 channels wide. The normal compiler selects LX
 storage and the move into down; the option does not reserve memory.
 
 This uses the existing `spyre_hint` API from torch-spyre PR #5057. The saved
-`6070e77` stack supports this flat MLP use. Decode, other shapes, other models,
-and unsupported rank groups use the normal path. The option is off by default.
+`6070e77` stack supports this MLP use. It also needs the frontend LX transfers
+and MLP prefix transfer described in torch-spyre issue #5575. On another
+compiler version, check that the requested splits are applied and the MLP
+values stay in LX. Hints alone do not guarantee either result.
+
+With batch 1, the option applies to every matching 512-row prefill chunk.
+Granite fixes the chunk size to 512. It pads shorter prompts to one chunk;
+every chunk of a longer prompt also takes this path. Only one 512-token chunk
+was compiled, checked and timed. Shorter prompts and later chunks were not
+validated. Decode, training, other shapes, other models, and unsupported rank
+groups use the normal path. The option is off by default. To disable it,
+unset the variable and reload the model.
+
+All four rank plans were checked separately on one card, with communication
+replaced by calls that return the input unchanged. The baseline already kept
+the MLP values in LX. No device speed gain was shown: rank-0 median device
+time was 54.473 ms off and 54.875 ms on. Wall time was 62.784 ms off and
+62.539 ms on. Ranks 0, 1 and 3 passed the required output checks. Rank 2 had
+the same hidden-output failure off and on; its cause is unresolved. Saved
+outputs matched byte for byte off/on on every rank. This is experimental
+evidence, not production qualification or a real distributed time-to-first-token
+result. The reported distributed regression was not reproduced.
