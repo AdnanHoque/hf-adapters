@@ -27,8 +27,6 @@ Usage::
     outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
-import os
-
 import torch
 
 from hf_adapters.hf_common import (
@@ -97,8 +95,6 @@ def _can_pad_mlp(mlp):
 
 def _can_force_mlp(mlp, config):
     """Use only the checked Granite 8B, four-rank, FP16 weight shapes."""
-    if os.environ.get("SPYRE_GRANITE_TP4_PREFILL_MLP", "0") != "1":
-        return False
     if (
         getattr(config, "model_type", None) != "granite"
         or config.hidden_size != 4096
