@@ -392,3 +392,16 @@ pre-commit run --all-files
 ## License
 
 Apache 2.0
+
+### Granite TP4 prefill work split (opt-in)
+
+Set `SPYRE_GRANITE_TP4_PREFILL_MLP=1` on **every rank before loading the model**
+to use the checked MLP work split for Granite 3.3 8B, TP4, FP16, batch 1,
+512-token prefill. Gate, activation, up and product use eight row groups and
+four column groups. Down uses the same split with the original 3200 input
+channels; storage stays 3328 channels wide. The normal compiler selects LX
+storage and the move into down; the option does not reserve memory.
+
+This uses the existing `spyre_hint` API from torch-spyre PR #5057. The saved
+`6070e77` stack supports this flat MLP use. Decode, other shapes, other models,
+and unsupported rank groups use the normal path. The option is off by default.

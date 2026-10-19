@@ -27,6 +27,8 @@ Usage::
     outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
+import os
+
 import torch
 
 from hf_adapters.hf_common import (
@@ -93,6 +95,71 @@ def _can_pad_mlp(mlp):
     )
 
 
+def _can_force_mlp(mlp, config):
+    """Use only the checked Granite 8B, four-rank, FP16 weight shapes."""
+    if os.environ.get("SPYRE_GRANITE_TP4_PREFILL_MLP", "0") != "1":
+        return False
+    if (
+        getattr(config, "model_type", None) != "granite"
+        or config.hidden_size != 4096
+        or config.intermediate_size != 12800
+        or config.num_hidden_layers != 40
+    ):
+        return False
+    projections = (mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+    mesh = getattr(mlp.gate_proj, "_spyre_mlp_width_mesh", None)
+    if mesh is None or mesh.ndim != 1 or mesh.size() != 4:
+        return False
+    return all(
+        proj.weight.dtype == torch.float16
+        and proj.bias is None
+        and tuple(proj.weight.shape) == shape
+        and getattr(proj, "_spyre_mlp_width_mesh", None) is mesh
+        for proj, shape in zip(projections, ((3200, 4096), (3200, 4096), (4096, 3200)))
+    )
+
+
+class _GraniteTP4PrefillMLP(PaddedGatedMLP):
+    """Keep the checked prefill work split across the complete MLP chain."""
+
+    def _use_forced_division(self, x):
+        return (
+            not self.training
+            and x.device.type == "spyre"
+            and x.dtype == torch.float16
+            and tuple(x.shape) == (1, 512, 4096)
+        )
+
+    def forward(self, x):
+        if not self._use_forced_division(x):
+            return super().forward(x)
+
+        from torch_spyre._inductor.propagate_hints import spyre_hint
+
+        # Name two flat axes so batch-one views do not change their meaning.
+        flat = x.view(512, 4096)
+        with spyre_hint(
+            named_dims=["granite_mlp_rows", "granite_mlp_channels"],
+            work_div={"granite_mlp_rows": 8, "granite_mlp_channels": 4},
+        ):
+            gate = self.act_fn(self.gate_proj(flat))
+            product = gate * self.up_proj(flat)
+        # Keep the 3200 real channels. The compiler moves this input within LX.
+        with spyre_hint(
+            named_dims=["granite_mlp_rows", "granite_mlp_hidden"],
+            work_div={"granite_mlp_rows": 8, "granite_mlp_hidden": 4},
+        ):
+            result = self.down_proj(product[:, : self.logical_width])
+        return result.view(1, 512, 4096)
+
+
+def _prepare_mlp(mlp, config):
+    if not _can_pad_mlp(mlp):
+        return mlp
+    cls = _GraniteTP4PrefillMLP if _can_force_mlp(mlp, config) else PaddedGatedMLP
+    return cls(mlp, 256)
+
+
 def _run_backbone_forward(
     model,
     input_ids,
@@ -154,8 +221,7 @@ def prepare_for_spyre(model):
     # Four fp16/bf16 output sticks balance the 32-core prefill projection.
     # Apply after TP loading: each rank preserves its original channel prefix.
     for layer in backbone.layers:
-        if _can_pad_mlp(layer.mlp):
-            layer.mlp = PaddedGatedMLP(layer.mlp, 256)
+        layer.mlp = _prepare_mlp(layer.mlp, text_config(model.config))
     model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
     model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)
     model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE
