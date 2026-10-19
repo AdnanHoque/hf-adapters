@@ -136,21 +136,17 @@ class _GraniteTP4PrefillMLP(PaddedGatedMLP):
 
         from torch_spyre._inductor.propagate_hints import spyre_hint
 
-        # Name two flat axes so batch-one views do not change their meaning.
-        flat = x.view(512, 4096)
         with spyre_hint(
-            named_dims=["granite_mlp_rows", "granite_mlp_channels"],
+            named_dims=["granite_mlp_batch", "granite_mlp_rows", "granite_mlp_channels"],
             work_div={"granite_mlp_rows": 8, "granite_mlp_channels": 4},
         ):
-            gate = self.act_fn(self.gate_proj(flat))
-            product = gate * self.up_proj(flat)
-        # Keep the 3200 real channels. The compiler moves this input within LX.
+            product = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        # Keep the 3200 real channels and let the compiler place the input.
         with spyre_hint(
-            named_dims=["granite_mlp_rows", "granite_mlp_hidden"],
+            named_dims=["granite_mlp_batch", "granite_mlp_rows", "granite_mlp_hidden"],
             work_div={"granite_mlp_rows": 8, "granite_mlp_hidden": 4},
         ):
-            result = self.down_proj(product[:, : self.logical_width])
-        return result.view(1, 512, 4096)
+            return self.down_proj(product[..., : self.logical_width])
 
 
 def _prepare_mlp(mlp, config):
