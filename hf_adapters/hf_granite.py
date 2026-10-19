@@ -133,7 +133,11 @@ class _GraniteTP4PrefillMLP(PaddedGatedMLP):
         from torch_spyre._inductor.propagate_hints import spyre_hint
 
         with spyre_hint(
-            named_dims=["granite_mlp_batch", "granite_mlp_rows", "granite_mlp_channels"],
+            named_dims=[
+                "granite_mlp_batch",
+                "granite_mlp_rows",
+                "granite_mlp_channels",
+            ],
             work_div={"granite_mlp_rows": 8, "granite_mlp_channels": 4},
         ):
             product = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
