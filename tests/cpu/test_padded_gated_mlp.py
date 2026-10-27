@@ -76,12 +76,20 @@ def test_padded_gated_mlp_preserves_prefix_and_excludes_nan_tail(dtype):
 
 
 @pytest.mark.parametrize(
-    "full_width,local_width,supported",
-    [(12800, 3200, True), (12800, 1600, False), (3200, 3200, False)],
+    "opt_in,full_width,local_width,supported",
+    [
+        (None, 12800, 3200, False),
+        ("1", 12800, 3200, True),
+        ("1", 12800, 1600, False),
+        ("1", 3200, 3200, False),
+    ],
 )
 def test_automatic_padding_is_limited_to_granite_tp4(
-    full_width, local_width, supported
+    monkeypatch, opt_in, full_width, local_width, supported
 ):
+    monkeypatch.delenv("SPYRE_GRANITE_TP4_MLP_PADDING", raising=False)
+    if opt_in is not None:
+        monkeypatch.setenv("SPYRE_GRANITE_TP4_MLP_PADDING", opt_in)
     config = SimpleNamespace(
         hidden_size=16, intermediate_size=full_width, hidden_act="silu", mlp_bias=False
     )
@@ -130,11 +138,20 @@ def test_automatic_padding_is_limited_to_granite_tp4(
 
 
 @pytest.mark.parametrize(
-    "full_width,tp_size,staged", [(12800, 4, True), (12800, 8, False), (6400, 4, False)]
+    "opt_in,full_width,tp_size,staged",
+    [
+        (None, 12800, 4, False),
+        ("1", 12800, 4, True),
+        ("1", 12800, 8, False),
+        ("1", 6400, 4, False),
+    ],
 )
 def test_granite_tp_load_stages_only_qualified_gate_up(
-    tmp_path, monkeypatch, full_width, tp_size, staged
+    tmp_path, monkeypatch, opt_in, full_width, tp_size, staged
 ):
+    monkeypatch.delenv("SPYRE_GRANITE_TP4_MLP_PADDING", raising=False)
+    if opt_in is not None:
+        monkeypatch.setenv("SPYRE_GRANITE_TP4_MLP_PADDING", opt_in)
     config = GraniteConfig(
         hidden_size=16,
         intermediate_size=full_width,

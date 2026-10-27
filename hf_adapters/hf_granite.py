@@ -25,7 +25,13 @@ Usage::
     tokenizer = AutoTokenizer.from_pretrained("/path/to/granite-3.3-8b-instruct")
     encoded = tokenizer(["Hello!"], return_tensors="pt")
     outputs = model.generate(**encoded, max_new_tokens=32)
+
+The experimental TP4 MLP storage width is disabled by default.
+Set SPYRE_GRANITE_TP4_MLP_PADDING=1 before loading to enable it.
+Real TP4 performance is not qualified.
 """
+
+import os
 
 import torch
 
@@ -42,9 +48,17 @@ from hf_adapters.hf_common import (
 )
 
 
+def _mlp_padding_enabled():
+    return os.getenv("SPYRE_GRANITE_TP4_MLP_PADDING") == "1"
+
+
 def spyre_tp_cpu_staged_modules(model, tp_size, plan):
     """Pad the qualified TP4 gate/up shards before their first Spyre copy."""
-    if tp_size != 4 or text_config(model.config).intermediate_size != 12800:
+    if (
+        not _mlp_padding_enabled()
+        or tp_size != 4
+        or text_config(model.config).intermediate_size != 12800
+    ):
         return set()
     return {
         f"{prefix}layers.*.mlp.{projection}"
@@ -56,6 +70,8 @@ def spyre_tp_cpu_staged_modules(model, tp_size, plan):
 
 def _can_pad_mlp(mlp):
     """Only widen the qualified 12800-channel MLP's 3200-channel TP4 shard."""
+    if not _mlp_padding_enabled():
+        return False
     from transformers.activations import SiLUActivation
     from transformers.models.granite.modeling_granite import GraniteMLP
 
