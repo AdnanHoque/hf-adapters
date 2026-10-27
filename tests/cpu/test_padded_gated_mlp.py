@@ -38,34 +38,8 @@ def test_padded_gated_mlp_preserves_prefix_and_excludes_nan_tail(dtype):
         hidden_size=16, intermediate_size=20, hidden_act="silu", mlp_bias=True
     )
     mlp = GraniteMLP(config).to(dtype=dtype).eval()
-    assert _can_pad_mlp(mlp)
-    # Install the real styles without a process group; eligibility never runs
-    # their communication hooks. Both unsupported variants must keep the MLP.
-    for gate, down_style, supported in (
-        (SpyreColwiseParallel(), SpyreRowwiseParallel(), True),
-        (SpyreColwiseGatherOutputParallel(), SpyreRowwiseParallel(), False),
-        (SpyreColwiseParallel(), SpyreRowwiseSplitInputParallel(), False),
-    ):
-        hooked = copy.deepcopy(mlp)
-        for proj, style in (
-            (hooked.gate_proj, gate),
-            (hooked.up_proj, SpyreColwiseParallel()),
-            (hooked.down_proj, down_style),
-        ):
-            style.prepare_module_tp(proj, None)
-        assert _can_pad_mlp(hooked) is supported
-        if supported:
-            # Replacing one hook preserves its count and role but invalidates
-            # the exact registrations certified by TP preparation.
-            key = next(iter(hooked.gate_proj._forward_hooks))
-            hooked.gate_proj._forward_hooks[key] = lambda mod, args, output: output
-            assert not _can_pad_mlp(hooked)
-    hook = mlp.register_forward_hook(lambda mod, args, output: output)
+    # The width helper remains general; automatic adaptation is TP4-only.
     assert not _can_pad_mlp(mlp)
-    hook.remove()
-    hook = mlp.gate_proj.register_forward_hook(lambda mod, args, output: output)
-    assert not _can_pad_mlp(mlp)
-    hook.remove()
     reference = copy.deepcopy(mlp)
     seen = []
     down = mlp.down_proj
@@ -85,6 +59,7 @@ def test_padded_gated_mlp_preserves_prefix_and_excludes_nan_tail(dtype):
         assert torch.equal(widened.weight[:20], original.weight)
         assert torch.equal(widened.bias[:20], original.bias)
         assert widened.weight.dtype == widened.bias.dtype == dtype
+        assert padded.state_dict()[f"{name}.weight"].shape == (24, 16)
         # A discarded NaN is stronger than assuming zero-valued padding.
         with torch.no_grad():
             widened.weight[20:].fill_(float("nan"))
@@ -92,3 +67,56 @@ def test_padded_gated_mlp_preserves_prefix_and_excludes_nan_tail(dtype):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert actual.shape == (2, 3, 16)
     assert seen[0].shape[-1] == 20 and seen[0].stride()[-2:] == (24, 1)
+
+
+@pytest.mark.parametrize(
+    "full_width,local_width,supported",
+    [(12800, 3200, True), (12800, 1600, False), (3200, 3200, False)],
+)
+def test_automatic_padding_is_limited_to_granite_tp4(
+    full_width, local_width, supported
+):
+    config = SimpleNamespace(
+        hidden_size=16, intermediate_size=full_width, hidden_act="silu", mlp_bias=False
+    )
+    mlp = GraniteMLP(config).half().eval()
+    for name in ("gate_proj", "up_proj"):
+        proj = getattr(mlp, name)
+        proj.weight = torch.nn.Parameter(proj.weight[:local_width].detach().clone())
+        proj.out_features = local_width
+    mlp.down_proj.weight = torch.nn.Parameter(
+        mlp.down_proj.weight[:, :local_width].detach().clone()
+    )
+    mlp.down_proj.in_features = local_width
+    assert _can_pad_mlp(mlp) is supported
+    if not supported:
+        return
+    # Install the real styles without a process group; eligibility never runs
+    # their communication hooks. Both unsupported variants must keep the MLP.
+    for gate, down_style, supported in (
+        (SpyreColwiseParallel(), SpyreRowwiseParallel(), True),
+        (SpyreColwiseGatherOutputParallel(), SpyreRowwiseParallel(), False),
+        (SpyreColwiseParallel(), SpyreRowwiseSplitInputParallel(), False),
+    ):
+        hooked = copy.deepcopy(mlp)
+        for proj, style in (
+            (hooked.gate_proj, gate),
+            (hooked.up_proj, SpyreColwiseParallel()),
+            (hooked.down_proj, down_style),
+        ):
+            style.prepare_module_tp(proj, None)
+            assert proj._spyre_tp_state[0] is style
+            assert not hasattr(proj, "_spyre_mlp_width_role")
+        assert _can_pad_mlp(hooked) is supported
+        if supported:
+            # Replacing one hook preserves its count and role but invalidates
+            # the exact registrations certified by TP preparation.
+            key = next(iter(hooked.gate_proj._forward_hooks))
+            hooked.gate_proj._forward_hooks[key] = lambda mod, args, output: output
+            assert not _can_pad_mlp(hooked)
+    hook = mlp.register_forward_hook(lambda mod, args, output: output)
+    assert not _can_pad_mlp(mlp)
+    hook.remove()
+    hook = mlp.gate_proj.register_forward_hook(lambda mod, args, output: output)
+    assert not _can_pad_mlp(mlp)
+    hook.remove()

@@ -3572,6 +3572,8 @@ class PaddedGatedMLP(nn.Module):
     modules themselves so their TP hooks and the down projection stay intact.
     The discarded channels never participate in a reduction, even if they
     contain NaNs. Parameter names and external activation shapes are unchanged.
+    Gate/up parameter shapes change. Save and reload after preparation are not
+    supported. Load the original checkpoint before preparation.
     """
 
     def __init__(self, mlp, multiple: int):
@@ -3592,7 +3594,10 @@ class PaddedGatedMLP(nn.Module):
             padded = weight.new_zeros((width, weight.shape[1]))
             padded[: self.logical_width].copy_(weight)
             if device.type == "spyre":
-                from hf_adapters.spyre_tensor_parallel import _copy_linear
+                from hf_adapters.spyre_tensor_parallel import (
+                    _copy_default,
+                    _copy_linear,
+                )
 
                 padded = _copy_linear(padded, device=device, dtype=dtype)
             else:
@@ -3602,8 +3607,13 @@ class PaddedGatedMLP(nn.Module):
                 bias = proj.bias.detach().cpu()
                 padded_bias = bias.new_zeros(width)
                 padded_bias[: self.logical_width].copy_(bias)
+                padded_bias = (
+                    _copy_default(padded_bias, device=device, dtype=dtype)
+                    if device.type == "spyre"
+                    else padded_bias.to(device)
+                )
                 proj.bias = nn.Parameter(
-                    padded_bias.to(device), requires_grad=proj.bias.requires_grad
+                    padded_bias, requires_grad=proj.bias.requires_grad
                 )
             proj.out_features = width
         self.train(mlp.training)

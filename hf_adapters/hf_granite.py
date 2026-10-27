@@ -43,9 +43,14 @@ from hf_adapters.hf_common import (
 
 
 def _can_pad_mlp(mlp):
-    """Only widen the standard inference MLP with local TP channel semantics."""
+    """Only widen the qualified 12800-channel MLP's 3200-channel TP4 shard."""
     from transformers.activations import SiLUActivation
     from transformers.models.granite.modeling_granite import GraniteMLP
+
+    from hf_adapters.spyre_tensor_parallel import (
+        SpyreColwiseParallel,
+        SpyreRowwiseParallel,
+    )
 
     if (
         type(mlp) is not GraniteMLP
@@ -60,10 +65,10 @@ def _can_pad_mlp(mlp):
         or mlp.act_fn._forward_hooks
     ):
         return False
-    for name, role in (
-        ("gate_proj", "colwise"),
-        ("up_proj", "colwise"),
-        ("down_proj", "rowwise"),
+    for name, style_type, partition_flag in (
+        ("gate_proj", SpyreColwiseParallel, "gather_output"),
+        ("up_proj", SpyreColwiseParallel, "gather_output"),
+        ("down_proj", SpyreRowwiseParallel, "split_input"),
     ):
         proj = getattr(mlp, name)
         if (
@@ -75,21 +80,24 @@ def _can_pad_mlp(mlp):
         # Unhooked projections are local. Hooked projections need the exact
         # supported Spyre style, with no extra hooks that could change channels.
         if proj._forward_pre_hooks or proj._forward_hooks:
+            state = getattr(proj, "_spyre_tp_state", None)
+            if not isinstance(state, tuple) or len(state) != 3:
+                return False
+            style, pre_hooks, post_hooks = state
             if (
-                getattr(proj, "_spyre_mlp_width_role", None) != role
+                type(style) is not style_type
+                or getattr(style, partition_flag)
                 or len(proj._forward_pre_hooks) != 1
                 or len(proj._forward_hooks) != 1
-                or getattr(proj, "_spyre_mlp_width_hooks", None)
-                != (
-                    tuple(proj._forward_pre_hooks.items()),
-                    tuple(proj._forward_hooks.items()),
-                )
+                or pre_hooks != tuple(proj._forward_pre_hooks.items())
+                or post_hooks != tuple(proj._forward_hooks.items())
             ):
                 return False
     width = mlp.down_proj.weight.shape[1]
     return (
         mlp.gate_proj.weight.shape[0] == mlp.up_proj.weight.shape[0] == width
-        and width % 256 != 0
+        and mlp.intermediate_size == 12800
+        and width == 3200
     )
 
 
@@ -151,7 +159,9 @@ def prepare_for_spyre(model):
         model, logits_processor=lambda logits: logits / logits_scaling
     )
     backbone = get_backbone(model)
-    # Four fp16/bf16 output sticks balance the 32-core prefill projection.
+    # TP4: 3200 channels are 50 sticks; 3328 channels are 52 sticks.
+    # Four column partitions can each use 13 whole sticks (832 channels).
+    # This permits an 8-by-4 prefill grid, without claiming a general speedup.
     # Apply after TP loading: each rank preserves its original channel prefix.
     for layer in backbone.layers:
         if _can_pad_mlp(layer.mlp):

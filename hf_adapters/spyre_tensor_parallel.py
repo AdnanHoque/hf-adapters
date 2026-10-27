@@ -84,12 +84,8 @@ class SpyreColwiseParallel(ColwiseParallel):
 
     def prepare_module_tp(self, module, device_mesh, **kwargs):
         super().prepare_module_tp(module, device_mesh, **kwargs)
-        module._spyre_mlp_width_role = (
-            "colwise"
-            if type(self) is SpyreColwiseParallel and not self.gather_output
-            else None
-        )
-        module._spyre_mlp_width_hooks = (
+        module._spyre_tp_state = (
+            self,
             tuple(module._forward_pre_hooks.items()),
             tuple(module._forward_hooks.items()),
         )
@@ -127,12 +123,8 @@ class SpyreRowwiseParallel(RowwiseParallel):
 
     def prepare_module_tp(self, module, device_mesh, **kwargs):
         super().prepare_module_tp(module, device_mesh, **kwargs)
-        module._spyre_mlp_width_role = (
-            "rowwise"
-            if type(self) is SpyreRowwiseParallel and not self.split_input
-            else None
-        )
-        module._spyre_mlp_width_hooks = (
+        module._spyre_tp_state = (
+            self,
             tuple(module._forward_pre_hooks.items()),
             tuple(module._forward_hooks.items()),
         )
