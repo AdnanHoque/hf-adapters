@@ -2477,10 +2477,14 @@ def _resolve_tp_plan(
         if auto_plan and grouped_colwise_policy is not None
         else {}
     )
+    cpu_staged_modules = set(getattr(adapter_module, "SPYRE_TP_CPU_STAGED_MODULES", ()))
+    cpu_staging_policy = getattr(adapter_module, "spyre_tp_cpu_staged_modules", None)
+    if cpu_staging_policy is not None:
+        cpu_staged_modules.update(cpu_staging_policy(probe, _resolve_tp_size(), plan))
     plan = prepare_spyre_tp_plan(
         probe,
         plan,
-        cpu_staged_modules=getattr(adapter_module, "SPYRE_TP_CPU_STAGED_MODULES", ()),
+        cpu_staged_modules=cpu_staged_modules,
         cpu_replicated_modules=cpu_replicated_modules,
         # hf-adapters pads/prepares the output projection after loading, and
         # historically keeps the common top-level text embedding replicated.

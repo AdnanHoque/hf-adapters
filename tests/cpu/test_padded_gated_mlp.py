@@ -19,13 +19,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import AutoModelForCausalLM, GraniteConfig
 from transformers.models.granite.modeling_granite import GraniteMLP
 
+from hf_adapters import hf_common, hf_granite
 from hf_adapters.hf_common import PaddedGatedMLP
 from hf_adapters.hf_granite import _can_pad_mlp
 from hf_adapters.spyre_tensor_parallel import (
+    SPYRE_COLWISE,
+    SPYRE_CPU_COLWISE,
+    SPYRE_ROWWISE,
     SpyreColwiseGatherOutputParallel,
     SpyreColwiseParallel,
+    SpyreCpuColwiseParallel,
     SpyreRowwiseParallel,
     SpyreRowwiseSplitInputParallel,
 )
@@ -93,8 +99,9 @@ def test_automatic_padding_is_limited_to_granite_tp4(
         return
     # Install the real styles without a process group; eligibility never runs
     # their communication hooks. Both unsupported variants must keep the MLP.
-    for gate, down_style, supported in (
+    for gate, down_style, style_supported in (
         (SpyreColwiseParallel(), SpyreRowwiseParallel(), True),
+        (SpyreCpuColwiseParallel(), SpyreRowwiseParallel(), True),
         (SpyreColwiseGatherOutputParallel(), SpyreRowwiseParallel(), False),
         (SpyreColwiseParallel(), SpyreRowwiseSplitInputParallel(), False),
     ):
@@ -107,8 +114,8 @@ def test_automatic_padding_is_limited_to_granite_tp4(
             style.prepare_module_tp(proj, None)
             assert proj._spyre_tp_state[0] is style
             assert not hasattr(proj, "_spyre_mlp_width_role")
-        assert _can_pad_mlp(hooked) is supported
-        if supported:
+        assert _can_pad_mlp(hooked) is style_supported
+        if style_supported:
             # Replacing one hook preserves its count and role but invalidates
             # the exact registrations certified by TP preparation.
             key = next(iter(hooked.gate_proj._forward_hooks))
@@ -120,3 +127,77 @@ def test_automatic_padding_is_limited_to_granite_tp4(
     hook = mlp.gate_proj.register_forward_hook(lambda mod, args, output: output)
     assert not _can_pad_mlp(mlp)
     hook.remove()
+
+
+@pytest.mark.parametrize(
+    "full_width,tp_size,staged", [(12800, 4, True), (12800, 8, False), (6400, 4, False)]
+)
+def test_granite_tp_load_stages_only_qualified_gate_up(
+    tmp_path, monkeypatch, full_width, tp_size, staged
+):
+    config = GraniteConfig(
+        hidden_size=16,
+        intermediate_size=full_width,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+    )
+    config.save_pretrained(tmp_path)
+    monkeypatch.setattr(hf_common, "_resolve_tp_size", lambda: tp_size)
+    plan, _ = hf_common._resolve_tp_plan(
+        tmp_path, AutoModelForCausalLM, "auto", hf_granite
+    )
+    for projection in ("gate_proj", "up_proj"):
+        assert plan[f"model.layers.*.mlp.{projection}"] == (
+            SPYRE_CPU_COLWISE if staged else SPYRE_COLWISE
+        )
+    assert plan["model.layers.*.self_attn.q_proj"] == SPYRE_COLWISE
+    if not staged:
+        return
+
+    explicit, _ = hf_common._resolve_tp_plan(
+        tmp_path,
+        AutoModelForCausalLM,
+        {
+            "model.layers.*.mlp.gate_proj": "colwise",
+            "model.layers.*.mlp.up_proj": "rowwise",
+        },
+        hf_granite,
+    )
+    assert explicit["model.layers.*.mlp.gate_proj"] == SPYRE_CPU_COLWISE
+    assert explicit["model.layers.*.mlp.up_proj"] == SPYRE_ROWWISE
+
+    # Use the real HF sharder. Staging and padding must not call a device DMA.
+    def unexpected_dma(*args, **kwargs):
+        pytest.fail("CPU staging copied a parameter to Spyre before padding")
+
+    monkeypatch.setattr(
+        "hf_adapters.spyre_tensor_parallel._copy_linear", unexpected_dma
+    )
+    mesh = SimpleNamespace(shape=(4,), size=lambda: 4)
+    mlp = GraniteMLP(config).half().eval()
+    for projection in ("gate_proj", "up_proj"):
+        proj = getattr(mlp, projection)
+        style = SpyreCpuColwiseParallel(
+            device_mesh=mesh, rank=1, empty_param=torch.empty(3200, 16)
+        )
+        original = proj.weight.detach().clone()
+        shard = style.shard_tensor(original, device="spyre", dtype=torch.float16)
+        torch.testing.assert_close(shard, original[3200:6400], rtol=0, atol=0)
+        assert shard.device.type == "cpu"
+        proj.weight = torch.nn.Parameter(shard)
+        proj.out_features = 3200
+        style.prepare_module_tp(proj, None)
+    mlp.down_proj.weight = torch.nn.Parameter(mlp.down_proj.weight[:, 3200:6400])
+    mlp.down_proj.in_features = 3200
+    assert _can_pad_mlp(mlp)
+    padded = PaddedGatedMLP(mlp, 256)
+    for projection in ("gate_proj", "up_proj"):
+        proj = getattr(padded, projection)
+        assert proj.weight.device.type == "cpu" and proj.weight.shape == (3328, 16)
+        assert torch.count_nonzero(proj.weight[3200:]) == 0
+        assert proj._spyre_tp_state[1:] == (
+            tuple(proj._forward_pre_hooks.items()),
+            tuple(proj._forward_hooks.items()),
+        )

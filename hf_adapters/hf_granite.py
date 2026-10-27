@@ -42,6 +42,18 @@ from hf_adapters.hf_common import (
 )
 
 
+def spyre_tp_cpu_staged_modules(model, tp_size, plan):
+    """Pad the qualified TP4 gate/up shards before their first Spyre copy."""
+    if tp_size != 4 or text_config(model.config).intermediate_size != 12800:
+        return set()
+    return {
+        f"{prefix}layers.*.mlp.{projection}"
+        for prefix in ("model.", "")
+        for projection in ("gate_proj", "up_proj")
+        if plan.get(f"{prefix}layers.*.mlp.{projection}") == "colwise"
+    }
+
+
 def _can_pad_mlp(mlp):
     """Only widen the qualified 12800-channel MLP's 3200-channel TP4 shard."""
     from transformers.activations import SiLUActivation
@@ -49,6 +61,7 @@ def _can_pad_mlp(mlp):
 
     from hf_adapters.spyre_tensor_parallel import (
         SpyreColwiseParallel,
+        SpyreCpuColwiseParallel,
         SpyreRowwiseParallel,
     )
 
@@ -65,10 +78,10 @@ def _can_pad_mlp(mlp):
         or mlp.act_fn._forward_hooks
     ):
         return False
-    for name, style_type, partition_flag in (
-        ("gate_proj", SpyreColwiseParallel, "gather_output"),
-        ("up_proj", SpyreColwiseParallel, "gather_output"),
-        ("down_proj", SpyreRowwiseParallel, "split_input"),
+    for name, style_types, partition_flag in (
+        ("gate_proj", (SpyreColwiseParallel, SpyreCpuColwiseParallel), "gather_output"),
+        ("up_proj", (SpyreColwiseParallel, SpyreCpuColwiseParallel), "gather_output"),
+        ("down_proj", (SpyreRowwiseParallel,), "split_input"),
     ):
         proj = getattr(mlp, name)
         if (
@@ -85,7 +98,7 @@ def _can_pad_mlp(mlp):
                 return False
             style, pre_hooks, post_hooks = state
             if (
-                type(style) is not style_type
+                type(style) not in style_types
                 or getattr(style, partition_flag)
                 or len(proj._forward_pre_hooks) != 1
                 or len(proj._forward_hooks) != 1
