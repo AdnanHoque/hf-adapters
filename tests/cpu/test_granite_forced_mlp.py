@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Automatic hints keep the checked model, rank group and prefill guards."""
+"""Opt-in hints retain the model, TP hook, mesh and prefill guards."""
 
+import sys
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.granite.modeling_granite import GraniteMLP
 
@@ -26,10 +28,17 @@ from hf_adapters.hf_granite import (
     _GraniteTP4PrefillMLP,
     _prepare_mlp,
 )
-from hf_adapters.spyre_tensor_parallel import SpyreColwiseParallel, SpyreRowwiseParallel
+from hf_adapters.spyre_tensor_parallel import (
+    SpyreColwiseParallel,
+    SpyreCpuColwiseParallel,
+    SpyreRowwiseParallel,
+)
 
 
-def test_granite_forced_mlp_default_and_guards(monkeypatch):
+@pytest.mark.parametrize(
+    "colwise_style", [SpyreColwiseParallel, SpyreCpuColwiseParallel]
+)
+def test_granite_forced_mlp_default_and_guards(monkeypatch, colwise_style):
     config = SimpleNamespace(
         model_type="granite",
         hidden_size=4096,
@@ -39,19 +48,34 @@ def test_granite_forced_mlp_default_and_guards(monkeypatch):
         mlp_bias=False,
     )
     local = SimpleNamespace(**vars(config))
-    local.intermediate_size = 3200
     with torch.device("meta"):
         mlp = GraniteMLP(local).to(dtype=torch.float16).eval()
+        for name in ("gate_proj", "up_proj"):
+            getattr(mlp, name).weight = torch.nn.Parameter(
+                torch.empty(3200, 4096, dtype=torch.float16)
+            )
+        mlp.down_proj.weight = torch.nn.Parameter(
+            torch.empty(4096, 3200, dtype=torch.float16)
+        )
     mesh = SimpleNamespace(ndim=1, size=lambda: 4)
     for name, style in (
-        ("gate_proj", SpyreColwiseParallel()),
-        ("up_proj", SpyreColwiseParallel()),
+        ("gate_proj", colwise_style()),
+        ("up_proj", colwise_style()),
         ("down_proj", SpyreRowwiseParallel()),
     ):
+        # Match the Transformers loader, which binds this before hook setup.
+        style.device_mesh = mesh
         style.prepare_module_tp(getattr(mlp, name), mesh)
+        assert getattr(mlp, name)._spyre_tp_mesh is mesh
+    monkeypatch.delenv("SPYRE_GRANITE_TP4_MLP_PADDING", raising=False)
+    assert not _can_force_mlp(mlp, config)
+    assert _prepare_mlp(mlp, config) is mlp
+    monkeypatch.setenv("SPYRE_GRANITE_TP4_MLP_PADDING", "0")
+    assert not _can_force_mlp(mlp, config)
+    monkeypatch.setenv("SPYRE_GRANITE_TP4_MLP_PADDING", "1")
     monkeypatch.delenv("SPYRE_GRANITE_TP4_PREFILL_MLP", raising=False)
     assert _can_force_mlp(mlp, config)
-    # The removed option has no effect, including an old explicit opt-out.
+    # The old hint option does not override the required padding opt-in.
     for value in ("0", "1", "invalid"):
         monkeypatch.setenv("SPYRE_GRANITE_TP4_PREFILL_MLP", value)
         assert _can_force_mlp(mlp, config)
@@ -71,11 +95,11 @@ def test_granite_forced_mlp_default_and_guards(monkeypatch):
     mesh.ndim = 2
     assert not _can_force_mlp(mlp, config)
     mesh.ndim = 1
-    mlp.up_proj._spyre_mlp_width_mesh = None
+    mlp.up_proj._spyre_tp_mesh = None
     assert not _can_force_mlp(mlp, config)
-    mlp.up_proj._spyre_mlp_width_mesh = SimpleNamespace(ndim=1, size=lambda: 4)
+    mlp.up_proj._spyre_tp_mesh = SimpleNamespace(ndim=1, size=lambda: 4)
     assert not _can_force_mlp(mlp, config)
-    mlp.up_proj._spyre_mlp_width_mesh = mesh
+    mlp.up_proj._spyre_tp_mesh = mesh
     for dtype in (torch.bfloat16, torch.float32):
         mlp.to(dtype=dtype)
         assert not _can_force_mlp(mlp, config)
@@ -125,17 +149,15 @@ def test_granite_forced_mlp_default_and_guards(monkeypatch):
     prepared.train()
     assert not prepared._use_forced_division(x)
 
-    # Unsupported weight shapes still use the existing padded module.
+    # Unsupported weight shapes retain their original module.
     tiny = SimpleNamespace(
         hidden_size=16, intermediate_size=20, hidden_act="silu", mlp_bias=False
     )
-    default = _prepare_mlp(GraniteMLP(tiny).half().eval(), config)
-    assert type(default) is PaddedGatedMLP
+    tiny_mlp = GraniteMLP(tiny).half().eval()
+    assert _prepare_mlp(tiny_mlp, config) is tiny_mlp
 
 
 def test_granite_forced_mlp_forward_scopes_and_fallback(monkeypatch):
-    import torch_spyre._inductor.propagate_hints as hints
-
     # Small CPU weights let us check the exact forward calls without a device.
     config = SimpleNamespace(
         hidden_size=16, intermediate_size=20, hidden_act="silu", mlp_bias=False
@@ -152,7 +174,9 @@ def test_granite_forced_mlp_forward_scopes_and_fallback(monkeypatch):
         yield
         events.append(("exit",))
 
-    monkeypatch.setattr(hints, "spyre_hint", record_hint)
+    hints = ModuleType("torch_spyre._inductor.propagate_hints")
+    hints.spyre_hint = record_hint
+    monkeypatch.setitem(sys.modules, hints.__name__, hints)
     # The real CPU guard must fall back and must not enter either hint scope.
     with torch.no_grad():
         torch.testing.assert_close(mlp(x), expected, rtol=0, atol=0)

@@ -22,7 +22,9 @@ import torch
 from hf_adapters.hf_common import run_lm_head
 
 
-@pytest.mark.parametrize("batch", [2])
+# At batch 1, `.contiguous()` on the last row returns the same view. That view
+# keeps the full prefill storage at a nonzero offset, so batch 1 needs the copy.
+@pytest.mark.parametrize("batch", [1, 2])
 def test_last_prefill_token_has_compact_independent_storage(batch):
     hidden = torch.arange(batch * 7 * 64).reshape(batch, 7, 64)
     model = SimpleNamespace(_spyre_lm_head_forward=lambda value: value)

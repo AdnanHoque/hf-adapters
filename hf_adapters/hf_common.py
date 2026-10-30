@@ -374,15 +374,16 @@ def moe_decode_selected_experts(
         # Widen topk's fp16 indices onto a stick before converting them to the
         # device's int32 gather indices. Chunked decode addresses expert-major
         # entries in flattened (token, selected expert) order.
-        # Convert the first element alone: the float32 holds each pair of sticks
-        # in an interleaved order, and a slice that splits a pair has no layout.
+        # Every lane holds the index, so take it as the max over the stick: the
+        # float32 holds each pair of sticks in an interleaved order, and a
+        # reduction reads it whole where a slice would split a pair.
         if decode_chunks == 1:
             # The layout pass inserts the restickify.
             index_stick = (
                 expert_indices[..., None].expand(T, top_k, stick_size).contiguous()
             )
             index_stick = index_stick.to(torch.float32)
-            index_address = index_stick[..., :1].to(torch.int32)
+            index_address = index_stick.amax(-1, keepdim=True).to(torch.int32)
             expert_indices = index_address[..., 0]
         else:
             expert_fp32 = (
@@ -391,7 +392,7 @@ def moe_decode_selected_experts(
                 .contiguous()
                 .to(torch.float32)
             )
-            expert_indices = expert_fp32[..., :1].to(torch.int32)[:, 0]
+            expert_indices = expert_fp32.amax(-1).to(torch.int32)
     else:
         index_address = None
         if decode_chunks == 1:
@@ -476,7 +477,7 @@ def moe_decode_selected_experts(
     entries = (expert_fp32[:, None, :] * chunk_scale + chunk_offsets).reshape(
         rows * decode_chunks, stick_size
     )
-    slice_index = entries[..., : stick_size // 2].to(torch.int32)[:, 0]
+    slice_index = entries.amax(-1).to(torch.int32)
     inputs = (
         x.reshape(T, 1, decode_chunks, slice_rows)
         .expand(T, top_k, decode_chunks, slice_rows)
@@ -2484,10 +2485,14 @@ def _resolve_tp_plan(
         if auto_plan and grouped_colwise_policy is not None
         else {}
     )
+    cpu_staged_modules = set(getattr(adapter_module, "SPYRE_TP_CPU_STAGED_MODULES", ()))
+    cpu_staging_policy = getattr(adapter_module, "spyre_tp_cpu_staged_modules", None)
+    if cpu_staging_policy is not None:
+        cpu_staged_modules.update(cpu_staging_policy(probe, _resolve_tp_size(), plan))
     plan = prepare_spyre_tp_plan(
         probe,
         plan,
-        cpu_staged_modules=getattr(adapter_module, "SPYRE_TP_CPU_STAGED_MODULES", ()),
+        cpu_staged_modules=cpu_staged_modules,
         cpu_replicated_modules=cpu_replicated_modules,
         # hf-adapters pads/prepares the output projection after loading, and
         # historically keeps the common top-level text embedding replicated.
@@ -3579,6 +3584,8 @@ class PaddedGatedMLP(nn.Module):
     modules themselves so their TP hooks and the down projection stay intact.
     The discarded channels never participate in a reduction, even if they
     contain NaNs. Parameter names and external activation shapes are unchanged.
+    Gate/up parameter shapes change. Save and reload after preparation are not
+    supported. Load the original checkpoint before preparation.
     """
 
     def __init__(self, mlp, multiple: int):
@@ -3599,7 +3606,10 @@ class PaddedGatedMLP(nn.Module):
             padded = weight.new_zeros((width, weight.shape[1]))
             padded[: self.logical_width].copy_(weight)
             if device.type == "spyre":
-                from hf_adapters.spyre_tensor_parallel import _copy_linear
+                from hf_adapters.spyre_tensor_parallel import (
+                    _copy_default,
+                    _copy_linear,
+                )
 
                 padded = _copy_linear(padded, device=device, dtype=dtype)
             else:
@@ -3609,8 +3619,13 @@ class PaddedGatedMLP(nn.Module):
                 bias = proj.bias.detach().cpu()
                 padded_bias = bias.new_zeros(width)
                 padded_bias[: self.logical_width].copy_(bias)
+                padded_bias = (
+                    _copy_default(padded_bias, device=device, dtype=dtype)
+                    if device.type == "spyre"
+                    else padded_bias.to(device)
+                )
                 proj.bias = nn.Parameter(
-                    padded_bias.to(device), requires_grad=proj.bias.requires_grad
+                    padded_bias, requires_grad=proj.bias.requires_grad
                 )
             proj.out_features = width
         self.train(mlp.training)

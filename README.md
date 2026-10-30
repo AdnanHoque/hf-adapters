@@ -1,6 +1,6 @@
 # HF Adapters for Spyre
 
-![adapters](https://img.shields.io/badge/adapters-40-blue)
+![adapters](https://img.shields.io/badge/adapters-41-blue)
 ![compatible](https://img.shields.io/badge/compatible_models-10K%2B-orange)
 
 Minimal runtime patches that make stock [HuggingFace Transformers](https://github.com/huggingface/transformers) models run on [Spyre](https://research.ibm.com/blog/ibm-spyre) accelerators.
@@ -13,17 +13,20 @@ from `transformers`.
 
 ## Supported Models
 
-**40 adapters · 10K+ compatible models**
+**41 adapters · 10K+ compatible models**
 
 Coverage spans **generative** (causal-LM), **embedding** (sentence-transformers),
-**sequence classification** (sentiment / text categorisation),
-**token classification** (NER/POS), **vision-language** (image→text), and
+**sequence classification** (sentiment / text categorisation), **structured
+decisions** (variable options plus action selection), **token classification**
+(NER/POS), **vision-language** (image→text), and
 **speculative-decoding drafter** models — from
 Llama / Qwen / Granite / Mistral / Phi / Gemma / OLMo / GPT decoders to BERT /
 XLM-RoBERTa / MPNet / ModernBERT encoders, the Granite Vision 4.1 (SigLIP tower +
 Granite text), Mistral3 Vision (Pixtral tower + Mistral text), and Gemma 4
 (encoder-free and full-vision) multimodal VLMs, plus the DSpark block-propose drafters for
 Qwen 3 / Granite / Gemma 4 and the XPress block-propose drafter (Gemma 4 26B-A4B).
+Laya support uses its optional upstream package to construct the stock decision
+model; hf-adapters patches its encoder, decision transformer, and marker selection.
 
 Each adapter covers all size variants and fine-tuned checkpoints sharing the same
 HuggingFace `model_type`. The **canonical, per-adapter model lists** — verified
@@ -35,6 +38,9 @@ Spyre numerical accuracy — live in **[ARCHITECTURE.md](ARCHITECTURE.md#verifie
 ```bash
 # Install core deps
 uv sync
+
+# Optional Laya typed-decision support
+uv sync --extra laya
 
 # Install core + dev deps
 uv sync --group dev
@@ -86,6 +92,34 @@ from hf_adapters import AutoSpyreModelForCausalLM, encode_prompts
 inputs = encode_prompts(tokenizer, ["What is 2+2?"])
 sequences = model.generate(**inputs, max_new_tokens=5)
 ```
+
+## Structured Decisions
+
+Laya keeps its native Agent API while patching its ModernBERT/mmBERT encoder,
+two-layer decision transformer, and marker/CLS selection to run on Spyre:
+
+```python
+from hf_adapters import laya_backend
+
+agent = laya_backend.load("convaiinnovations/laya")
+result = agent.predict(
+    "The production API is down and customers cannot log in.",
+    {
+        "department": {
+            "type": "choice",
+            "instructions": "Which team should handle this?",
+            "criteria": {
+                "billing": "payments and refunds",
+                "technical": "bugs and outages",
+                "other": "anything else",
+            },
+        }
+    },
+)
+```
+
+Question-type lookup, scoring, and Agent orchestration remain on CPU. Select a
+bundled checkpoint with `subfolder="typed-decisions"` or `subfolder="multilingual"`.
 
 ## Embedding Models
 
@@ -393,40 +427,17 @@ pre-commit run --all-files
 
 Apache 2.0
 
-### Granite TP4 prefill work split (automatic, experimental)
+### Experimental Granite TP4 MLP work splits
 
-The experimental MLP work split applies automatically to matching
-Granite 3.3 8B, TP4, FP16, batch-1 inputs. No environment flag is needed;
-`SPYRE_GRANITE_TP4_PREFILL_MLP` is no longer read, even when set to `0`.
-Gate, activation, up and product use eight row groups and
-four column groups. Down uses the same split with the original 3200 input
-channels; storage stays 3328 channels wide. The normal compiler selects LX
-storage and the move into down; the hints do not reserve memory.
-The existing 80% frontend / 20% backend LX split stays unchanged.
+This hint candidate is parked. Current merged main already selects the requested
+8-by-4 divisions for the tested padded block.
+Padding stays off by default. Set `SPYRE_GRANITE_TP4_MLP_PADDING=1` before
+loading to opt in. Eligible padded Granite 3.3 8B TP4 prefill calls then request
+an eight-row-group, four-column-group split. Other calls retain the normal path.
 
-This uses the existing `spyre_hint` API from torch-spyre PR #5057. The saved
-`6070e77` stack supports this MLP use. It also needs the frontend LX transfers
-and MLP prefix transfer described in torch-spyre issue #5575. On another
-compiler version, check that the requested splits are applied and the MLP
-values stay in LX. Hints alone do not guarantee either result.
-
-With batch 1, the hints apply to every matching 512-row prefill chunk.
-Granite fixes the chunk size to 512. It pads shorter prompts to one chunk;
-every chunk of a longer prompt also takes this path. Only one 512-token chunk
-was compiled, checked and timed. Shorter prompts and later chunks were not
-validated. Decode, training, other shapes, other models, TP1, and unsupported
-rank groups use the normal path. See the exact guards in
-[the work-split notes](docs/granite_tp4_prefill_mlp.md).
-
-All four rank plans were checked separately on one card, with communication
-replaced by calls that return the input unchanged. The baseline already kept
-the MLP values in LX. No device speed gain was shown: rank-0 median device
-time was 54.473 ms without hints and 54.875 ms with hints. Wall time was
-62.784 ms without hints and 62.539 ms with hints. These are saved results
-from the same hinted computation before automatic enablement; timing was
-not repeated for this change. Ranks 0, 1 and 3 passed the required output
-checks. Rank 2 had
-the same hidden-output failure off and on; its cause is unresolved. Saved
-outputs matched byte for byte off/on on every rank. This is experimental
-evidence, not production qualification or a real distributed time-to-first-token
-result. The reported distributed regression was not reproduced.
+The current-main one-card, 40-layer comparison found no clear extra gain from
+these hints. Device layer time was 51.654 ms with padding alone and 51.655 ms
+with hints. Both emitted the same captured program summaries, including the
+requested MLP divisions. All-kernel and wall times were also at parity.
+This test does not qualify distributed TP4 or serving performance. See the
+[work-split notes](docs/granite_tp4_prefill_mlp.md) for guards and test scope.
